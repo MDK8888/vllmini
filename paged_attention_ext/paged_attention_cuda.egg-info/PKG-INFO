@@ -1,0 +1,5 @@
+Metadata-Version: 2.1
+Name: paged_attention_cuda
+Version: 0.1.0
+Summary: CUDA kernels for paged attention
+Author: Ken Ding + Claude 3.5 Sonnet

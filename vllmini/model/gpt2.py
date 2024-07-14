@@ -197,6 +197,63 @@ class GPT2LMHeadModel(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.lm_head.weight = self.transformer.wte.weight
 
+    def load_huggingface_weights(self, model_name_or_path: str):
+        from transformers import GPT2LMHeadModel as HFModel
+        print(f"Loading weights from {model_name_or_path}")
+        hf_model = HFModel.from_pretrained(model_name_or_path)
+        hf_state_dict = hf_model.state_dict()
+
+        # Create a mapping between HuggingFace state dict keys and our model's keys
+        key_mapping = {
+            'transformer.wte.weight': 'transformer.wte.weight',
+            'transformer.wpe.weight': 'transformer.wpe.weight',
+            'transformer.ln_f.weight': 'transformer.ln_f.weight',
+            'transformer.ln_f.bias': 'transformer.ln_f.bias',
+            'lm_head.weight': 'lm_head.weight',
+        }
+
+        # Add mappings for each layer
+        for i in range(self.config.num_hidden_layers):
+            hf_prefix = f'transformer.h.{i}.'
+            our_prefix = f'transformer.h.{i}.'
+            layer_mapping = {
+                f'{hf_prefix}ln_1.weight': f'{our_prefix}ln_1.weight',
+                f'{hf_prefix}ln_1.bias': f'{our_prefix}ln_1.bias',
+                f'{hf_prefix}attn.c_attn.weight': f'{our_prefix}attn.c_attn.weight',
+                f'{hf_prefix}attn.c_attn.bias': f'{our_prefix}attn.c_attn.bias',
+                f'{hf_prefix}attn.c_proj.weight': f'{our_prefix}attn.c_proj.weight',
+                f'{hf_prefix}attn.c_proj.bias': f'{our_prefix}attn.c_proj.bias',
+                f'{hf_prefix}ln_2.weight': f'{our_prefix}ln_2.weight',
+                f'{hf_prefix}ln_2.bias': f'{our_prefix}ln_2.bias',
+                f'{hf_prefix}mlp.c_fc.weight': f'{our_prefix}mlp.c_fc.weight',
+                f'{hf_prefix}mlp.c_fc.bias': f'{our_prefix}mlp.c_fc.bias',
+                f'{hf_prefix}mlp.c_proj.weight': f'{our_prefix}mlp.c_proj.weight',
+                f'{hf_prefix}mlp.c_proj.bias': f'{our_prefix}mlp.c_proj.bias',
+            }
+            key_mapping.update(layer_mapping)
+
+        # Create a new state dict for our model
+        new_state_dict = {}
+        for hf_key, our_key in key_mapping.items():
+            if hf_key in hf_state_dict:
+                # Transpose weights for linear layers
+                if 'attn.c_attn.weight' in hf_key or 'attn.c_proj.weight' in hf_key or 'mlp.c_fc.weight' in hf_key or 'mlp.c_proj.weight' in hf_key:
+                    new_state_dict[our_key] = hf_state_dict[hf_key].t()
+                else:
+                    new_state_dict[our_key] = hf_state_dict[hf_key]
+            else:
+                print(f"Warning: Key {hf_key} not found in HuggingFace model")
+
+        # Load the new state dict into our model
+        missing_keys, unexpected_keys = self.load_state_dict(new_state_dict, strict=False)
+        
+        if missing_keys:
+            print(f"Warning: Missing keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"Warning: Unexpected keys: {unexpected_keys}")
+
+        print("Weights loaded successfully")
+
     def forward(
         self,
         input_ids: torch.Tensor,

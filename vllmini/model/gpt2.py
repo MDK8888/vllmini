@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from transformers import GPT2Config
+from transformers import GPT2Config, GPT2LMHeadModel
 from typing import List, Optional, Tuple, Iterable
 
 from paged_attention_cuda import paged_attention_v1
@@ -16,31 +16,54 @@ class GPT2Attention(nn.Module):
         self.c_attn = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=True)
         self.c_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
 
+        # Parameters for paged attention
+        self.block_size = 16  # You may want to make this configurable
+        self.max_num_blocks_per_seq = 1024  # Adjust as needed
+
     def forward(
         self,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         max_seq_len: int,
     ) -> torch.Tensor:
+        batch_size, seq_length, _ = hidden_states.size()
+        assert seq_length == 1, "Given the kv cache, only 1 hidden state is necessary"
+        hidden_states = hidden_states.view(batch_size, -1)
         qkv = self.c_attn(hidden_states)
-        q, k, v = qkv.chunk(chunks=3, dim=-1)
+        q, k, v = qkv.split(self.hidden_size, dim=-1)
         
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_heads, self.head_dim)
-        v = v.view(-1, self.num_heads, self.head_dim)
+        q = q.view(batch_size, self.num_heads, self.head_dim)
+        k = k.view(batch_size, self.num_heads, -1, self.head_dim)
+        v = v.view(batch_size, self.num_heads, -1, self.head_dim)
 
-        attn_output = paged_attention_v1(
-            out=torch.empty_like(q),
+        # Prepare the caches if they're not already in the correct format
+        key_cache = key_cache.view(batch_size, self.num_heads, -1, self.head_dim)
+        key_cache = torch.cat([key_cache, k], dim=-2)
+        value_cache = value_cache.view(batch_size, self.num_heads, -1, self.head_dim)
+        value_cache = torch.cat([value_cache, v], dim=-2)
+
+        # Ensure block_tables has the correct shape
+        if block_tables.dim() != 2:
+            block_tables = block_tables.view(batch_size, -1)
+        
+        # Ensure seq_lens has the correct shape
+        if seq_lens.dim() != 1:
+            seq_lens = seq_lens.view(-1)
+
+        out = torch.empty_like(q)
+        paged_attention_v1(
+            out=out,
             query=q,
-            key_cache=k,
-            value_cache=v,
+            key_cache=key_cache,
+            value_cache=value_cache,
             num_kv_heads=self.num_heads,
             scale=self.scale,
             block_tables=block_tables,
             seq_lens=seq_lens,
-            block_size=64,  # Adjust this value as needed
+            block_size=self.block_size,
             max_seq_len=max_seq_len,
             alibi_slopes=None,
             kv_cache_dtype="float32",
@@ -52,9 +75,9 @@ class GPT2Attention(nn.Module):
             blocksparse_head_sliding_step=0
         )
 
-        attn_output = attn_output.contiguous().view(-1, self.hidden_size)
+        attn_output = out.transpose(1, 2).contiguous().view(batch_size, seq_length, self.hidden_size)
         attn_output = self.c_proj(attn_output)
-        return attn_output
+        return attn_output, key_cache, value_cache
 
 class GPT2MLP(nn.Module):
     def __init__(self, intermediate_size: int, config: GPT2Config):
@@ -72,38 +95,38 @@ class GPT2MLP(nn.Module):
 class GPT2Block(nn.Module):
     def __init__(self, config: GPT2Config):
         super().__init__()
-        hidden_size = config.hidden_size
-        inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
-
-        self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+        self.ln_1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.attn = GPT2Attention(config)
-        self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.mlp = GPT2MLP(inner_dim, config)
+        self.ln_2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.mlp = GPT2MLP(config.intermediate_size, config)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         max_seq_len: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
-        attn_output = self.attn(
-            hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_seq_len=max_seq_len,
+        attn_output, new_key_cache, new_value_cache = self.attn(
+            hidden_states,
+            key_cache,
+            value_cache,
+            block_tables,
+            seq_lens,
+            max_seq_len
         )
         hidden_states = attn_output + residual
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
-        feed_forward_hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + feed_forward_hidden_states
-        return hidden_states
+        feed_forward_output = self.mlp(hidden_states)
+        hidden_states = feed_forward_output + residual
+
+        return hidden_states, new_key_cache, new_value_cache
 
 class GPT2Model(nn.Module):
     def __init__(self, config: GPT2Config):
@@ -121,26 +144,33 @@ class GPT2Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_caches: List[torch.Tensor],
+        key_caches: List[torch.Tensor],
+        value_caches: List[torch.Tensor],
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         max_seq_len: int,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         inputs_embeds = self.wte(input_ids)
         position_embeds = self.wpe(position_ids)
         hidden_states = inputs_embeds + position_embeds
 
+        new_key_caches = []
+        new_value_caches = []
+
         for i, layer in enumerate(self.h):
-            hidden_states = layer(
+            hidden_states, new_key_cache, new_value_cache = layer(
                 hidden_states,
-                kv_caches[i],
+                key_caches[i],
+                value_caches[i],
                 block_tables,
                 seq_lens,
                 max_seq_len,
             )
+            new_key_caches.append(new_key_cache)
+            new_value_caches.append(new_value_cache)
 
         hidden_states = self.ln_f(hidden_states)
-        return hidden_states
+        return hidden_states, new_key_caches, new_value_caches
 
 class GPT2LMHeadModel(nn.Module):
     def __init__(self, config: GPT2Config):
@@ -156,49 +186,23 @@ class GPT2LMHeadModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_caches: List[torch.Tensor],
+        key_caches: List[torch.Tensor],
+        value_caches: List[torch.Tensor],
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         max_seq_len: int,
-    ) -> torch.Tensor:
-        hidden_states = self.transformer(
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+        hidden_states, new_key_caches, new_value_caches = self.transformer(
             input_ids,
             position_ids,
-            kv_caches,
+            key_caches,
+            value_caches,
             block_tables,
             seq_lens,
             max_seq_len,
         )
         lm_logits = self.lm_head(hidden_states)
-        return lm_logits
-
-    def sample(self, logits: torch.Tensor) -> torch.Tensor:
-        # Simple greedy sampling
-        return torch.argmax(logits, dim=-1)
-
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        max_length: int,
-        block_tables: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ) -> torch.Tensor:
-        batch_size, seq_length = input_ids.shape
-        position_ids = torch.arange(seq_length, device=input_ids.device).unsqueeze(0)
-        
-        # Initialize KV caches
-        kv_caches = [torch.zeros((batch_size, self.config.num_attention_heads, seq_length, self.config.hidden_size // self.config.num_attention_heads), 
-                                 device=input_ids.device) 
-                     for _ in range(self.config.num_hidden_layers)]
-
-        for _ in range(max_length - seq_length):
-            logits = self.forward(input_ids, position_ids, kv_caches, block_tables, seq_lens, max_length)
-            next_token = self.sample(logits[:, -1, :])
-            input_ids = torch.cat([input_ids, next_token.unsqueeze(-1)], dim=-1)
-            position_ids = torch.cat([position_ids, (position_ids[:, -1] + 1).unsqueeze(-1)], dim=-1)
-            seq_lens += 1
-
-        return input_ids
+        return lm_logits, new_key_caches, new_value_caches
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         model_state_dict = self.state_dict()

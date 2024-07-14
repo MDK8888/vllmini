@@ -1,2 +1,2 @@
 # vllmini
-A minimal implementation of vllm.
+A kernel-up, minimal implementation of vllm.

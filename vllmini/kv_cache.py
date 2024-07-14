@@ -1,6 +1,6 @@
 from typing import List
 import torch
-import cache_ops  # Assuming this module exposes the CUDA kernels
+from paged_attention_cuda import cache_ops # Assuming this module exposes the CUDA kernels
 
 class KVCache:
     def __init__(self, num_blocks: int, num_heads: int, head_size: int, block_size: int):

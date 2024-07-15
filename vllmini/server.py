@@ -2,12 +2,12 @@ import asyncio
 from fastapi import FastAPI, BackgroundTasks
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from transformers import GPT2Config, GPT2Tokenizer
+import torch
 
 from .kv_cache import KVCache
 from .paged_attention import PagedAttention
 from .scheduler import Scheduler
-from .sequence_manager import SequenceManager
 
 class GenerationRequest(BaseModel):
     prompt: str
@@ -18,23 +18,31 @@ class GenerationResponse(BaseModel):
 
 sequence_counter = 0
 paged_attention = None
-seq_manager = None
 scheduler = None
+tokenizer = None
+sequences = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global paged_attention, seq_manager, scheduler
+    global paged_attention, scheduler, tokenizer
     
     # Initialize components
-    model = GPT2LMHeadModel.from_pretrained("gpt2").to('cuda')
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    config = GPT2Config.from_pretrained("gpt2")
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    kv_cache = KVCache(num_blocks=1000, num_heads=12, head_size=64, block_size=128)
-    paged_attention = PagedAttention(model, kv_cache)
-    seq_manager = SequenceManager()
-    scheduler = Scheduler(paged_attention, seq_manager)
+    num_layers = config.n_layer
+    num_blocks = 1000
+    num_heads = config.num_attention_heads
+    head_size = config.hidden_size // num_heads
+    block_size = 128
+    kv_cache = KVCache(num_layers, num_blocks, num_heads, head_size, block_size)
+    paged_attention = PagedAttention("gpt2", kv_cache, device)
+    
+    # Initialize the scheduler with the paged_attention object
+    scheduler = Scheduler(paged_attention)
     
     # Start the scheduler
-    scheduler_task = asyncio.create_task(scheduler.run())
+    scheduler_task = asyncio.create_task(scheduler_runner())
     
     yield
     
@@ -45,29 +53,34 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+async def scheduler_runner():
+    while True:
+        scheduler.run()
+        await asyncio.sleep(0.01)  # Small delay to prevent CPU hogging
+
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/generate", response_model=GenerationResponse)
-async def generate(request: GenerationRequest, background_tasks: BackgroundTasks):
+async def generate(request: GenerationRequest):
     global sequence_counter
     sequence_counter += 1
     seq_id = sequence_counter
 
-    tokens = paged_attention.model.tokenizer.encode(request.prompt)
-    seq_manager.add_sequence(seq_id, tokens, request.max_length)
-    background_tasks.add_task(scheduler.add_sequence, seq_id)
+    tokens = tokenizer.encode(request.prompt)
+    input_ids = torch.tensor([tokens], dtype=torch.int64, device=paged_attention.device)
+    position_ids = torch.arange(len(tokens), dtype=torch.int64, device=paged_attention.device).unsqueeze(0)
+    attention_mask = torch.ones((1, 1, len(tokens), len(tokens)), dtype=torch.float32, device=paged_attention.device)
+    slot_mapping = torch.arange(len(tokens), dtype=torch.int64, device=paged_attention.device)
+
+    scheduler.add_sequence(seq_id, input_ids, position_ids, attention_mask, slot_mapping, request.max_length)
 
     return GenerationResponse(sequence_id=seq_id)
 
 @app.get("/result/{seq_id}")
 async def get_result(seq_id: int):
-    seq = seq_manager.sequences.get(seq_id)
-    if seq is None:
+    status = scheduler.get_sequence_status(seq_id)
+    if status is None:
         return {"status": "not found"}
-    if seq_id in seq_manager.active_sequences:
-        return {"status": "in progress", "generated": paged_attention.model.tokenizer.decode(seq.tokens)}
-    return {"status": "completed", "generated": paged_attention.model.tokenizer.decode(seq.tokens)}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    if not status["completed"]:
+        return {"status": "in progress", "generated": tokenizer.decode(status["tokens"])}
+    return {"status": "completed", "generated": tokenizer.decode(status["tokens"])}

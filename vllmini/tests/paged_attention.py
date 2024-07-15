@@ -8,12 +8,13 @@ def test_paged_attention():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     model_name = "gpt2"
+    num_layers = 12
     config = GPT2Config.from_pretrained(model_name)
     num_blocks = 20
     num_heads = config.num_attention_heads
     head_size = config.hidden_size // num_heads
     block_size = 16
-    kv_cache = KVCache(num_blocks, num_heads, head_size, block_size)
+    kv_cache = KVCache(num_layers, num_blocks, num_heads, head_size, block_size)
     paged_attention = PagedAttention(model_name, kv_cache, device)
 
     def generate_input(batch_size, seq_len):
@@ -47,12 +48,12 @@ def test_paged_attention():
     assert output.shape == (batch_size, seq_len, config.vocab_size), "Incorrect output shape for prefill"
     assert len(kv_cache.allocated_blocks[seq_id]) == (seq_len + block_size - 1) // block_size, "Incorrect number of blocks allocated for prefill"
     print("Prefill test passed.")
-    
+
     print("\nTesting decoding (single token generation)...")
     input_ids, position_ids, attention_mask = generate_input(batch_size, 1)
 
     # Create slot_mapping for decoding
-    slot_mapping = torch.tensor([seq_len], dtype=torch.long, device=paged_attention.device)
+    slot_mapping = torch.tensor([seq_len], dtype=torch.int64, device=paged_attention.device)
 
     output = paged_attention.forward(
         input_ids, 

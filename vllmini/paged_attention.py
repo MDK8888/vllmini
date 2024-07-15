@@ -86,4 +86,9 @@ class PagedAttention:
 
         return output
 
-    # ... (rest of the methods remain the same)
+    def copy_blocks(self, seq_id: int, new_block_mapping: List[Tuple[int, int]]):
+        block_mapping = torch.tensor(new_block_mapping, dtype=torch.long, device=self.device)
+        self.kv_cache.copy_blocks(block_mapping)
+
+    def free_memory(self, seq_id: int):
+        self.kv_cache.free(seq_id)

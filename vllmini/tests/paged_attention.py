@@ -18,11 +18,10 @@ def test_paged_attention():
     paged_attention = PagedAttention(model_name, kv_cache, device)
 
     def generate_input(batch_size, seq_len):
-        input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len), dtype=torch.long, device=device)
-        position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)
+        input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len), dtype=torch.int32, device=device)
+        position_ids = torch.arange(seq_len, dtype=torch.int32, device=device).unsqueeze(0).expand(batch_size, -1)
 
         upper_triangular = torch.triu(torch.full((seq_len, seq_len), float('inf')), diagonal=1)
-        # Expand the upper triangular matrix to match the desired shape
         attention_mask = upper_triangular.unsqueeze(0).unsqueeze(0)  # shape (1, 1, seq_len, seq_len)
         attention_mask = attention_mask.expand(batch_size, num_heads, seq_len, seq_len).to(device)
         return input_ids, position_ids, attention_mask
@@ -32,8 +31,7 @@ def test_paged_attention():
     input_ids, position_ids, attention_mask = generate_input(batch_size, seq_len)
     seq_id = 1
 
-    # Create slot_mapping for prefill
-    slot_mapping = torch.arange(seq_len, dtype=torch.long, device=paged_attention.device)
+    slot_mapping = torch.arange(seq_len, dtype=torch.int64, device=paged_attention.device)
 
     output = paged_attention.forward(
         input_ids, 
@@ -52,7 +50,6 @@ def test_paged_attention():
     print("\nTesting decoding (single token generation)...")
     input_ids, position_ids, attention_mask = generate_input(batch_size, 1)
 
-    # Create slot_mapping for decoding
     slot_mapping = torch.tensor([seq_len], dtype=torch.int64, device=paged_attention.device)
 
     output = paged_attention.forward(
@@ -85,11 +82,10 @@ def test_paged_attention():
 
     print("\nTesting sequence continuation...")
     seq_id_3 = 3
-    initial_seq_len = 128  # This was the length of the sequence we prefilled for seq_id_3
+    initial_seq_len = 128
 
     continuation_input_ids, continuation_position_ids, continuation_attention_mask = generate_input(1, 1)
 
-    # Calculate the correct slot_mapping for continuation
     continuation_slot_mapping = torch.tensor([initial_seq_len], dtype=torch.int64, device=paged_attention.device)
 
     continuation_output = paged_attention.forward(
@@ -119,14 +115,36 @@ def test_paged_attention():
     except ValueError:
         print("Error handling for non-existent seq_id passed.")
 
-    print("\nTesting long sequence handling...")
-    long_seq_len = 2000  # Longer than the model's n_positions
+    print("\nTesting long sequence handling and swapping...")
+    # Fill up the GPU memory
+    for i in range(4, num_blocks):  # Leave some blocks for the long sequence
+        seq_len = block_size * 2  # Each sequence takes 2 blocks
+        input_ids, position_ids, attention_mask = generate_input(1, seq_len)
+        slot_mapping = torch.arange(seq_len, dtype=torch.int64, device=paged_attention.device)
+        paged_attention.forward(input_ids, position_ids, attention_mask, use_cache=True, is_prefill=True, seq_id=i)
+
+    # Now try to allocate a long sequence that should trigger swapping
+    long_seq_len = block_size * 3  # This should be longer than the available free blocks
     input_ids, position_ids, attention_mask = generate_input(1, long_seq_len)
+    slot_mapping = torch.arange(long_seq_len, dtype=torch.int64, device=paged_attention.device)
+    
     try:
-        paged_attention.forward(input_ids, position_ids, attention_mask, use_cache=True, is_prefill=True, seq_id=6)
-        print("Long sequence handling test passed.")
+        paged_attention.forward(input_ids, position_ids, attention_mask, use_cache=True, is_prefill=True, seq_id=num_blocks)
+        print("Long sequence handling and swapping test passed.")
     except RuntimeError as e:
-        print(f"Failed: Long sequence handling raised an error: {e}")
+        print(f"Failed: Long sequence handling and swapping raised an error: {e}")
+
+    # Test accessing a potentially swapped out sequence
+    try:
+        seq_id_to_recall = 4  # This should be one of the first sequences we allocated
+        recall_input_ids, recall_position_ids, recall_attention_mask = generate_input(1, 1)
+        recall_slot_mapping = torch.tensor([block_size * 2], dtype=torch.int64, device=paged_attention.device)
+        paged_attention.forward(recall_input_ids, recall_position_ids, recall_attention_mask, 
+                                use_cache=True, is_prefill=False, seq_id=seq_id_to_recall,
+                                slot_mapping=recall_slot_mapping)
+        print("Swapped sequence recall test passed.")
+    except Exception as e:
+        print(f"Failed: Swapped sequence recall test raised an error: {e}")
 
     print("\nAll tests completed.")
 

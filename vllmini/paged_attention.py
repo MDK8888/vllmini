@@ -1,16 +1,17 @@
 from typing import List, Tuple, Optional
 import torch
+from transformers import GPT2Config
+from vllmini.model.gpt2 import GPT2LMHeadModel
 from .kv_cache import KVCache
-from .sequence_manager import Sequence, SequenceManager
 
 class PagedAttention:
-    def __init__(self, model, kv_cache: KVCache):
-        self.model = model
+    def __init__(self, model_name: str, kv_cache: KVCache, device: str):
+        self.device = device
+        config = GPT2Config.from_pretrained(model_name)
+        self.model = GPT2LMHeadModel(config)
+        self.model.load_huggingface_weights(model_name)
+        self.model = self.model.to(self.device)
         self.kv_cache = kv_cache
-
-    def allocate_kv_blocks(self, seq_id: int, seq_len: int):
-        num_blocks_needed = (seq_len + self.kv_cache.block_size - 1) // self.kv_cache.block_size
-        return self.kv_cache.allocate(seq_id, num_blocks_needed)
 
     def forward(self, 
                 input_ids: torch.Tensor,
@@ -18,43 +19,51 @@ class PagedAttention:
                 attention_mask: Optional[torch.Tensor] = None,
                 use_cache: bool = True,
                 is_prefill: bool = True,
-                seq_id: Optional[int] = None,
-                key_caches: Optional[List[torch.Tensor]] = None,
-                value_caches: Optional[List[torch.Tensor]] = None,
-                block_tables: Optional[torch.Tensor] = None,
-                seq_lens: Optional[torch.Tensor] = None,
-                max_seq_len: Optional[int] = None):
+                seq_id:int = -1,
+                slot_mapping: Optional[torch.Tensor] = None):
         
         batch_size, seq_len = input_ids.shape
 
         if is_prefill:
             # Allocate new blocks for prefill
-            if seq_id is not None:
-                self.allocate_kv_blocks(seq_id, seq_len)
+            num_blocks_needed = (seq_len + self.kv_cache.block_size - 1) // self.kv_cache.block_size
+            self.kv_cache.allocate(seq_id, num_blocks_needed)
             
             # Use vanilla attention for prefilling
             output, presents = self.model(input_ids, position_ids, attention_mask, use_cache, is_prefill)
             
             # Cache the key-value pairs
-            if seq_id is not None:
+            if slot_mapping is not None:
                 for layer_idx, (key, value) in enumerate(presents):
-                    slot_mapping = torch.arange(seq_len, device='cuda')
+                    # initially, key.shape, value.shape will be (batch_size, num_heads, seq_len, head_dim).
+                    # we want them to be (seq_len, num_heads, head_dim)
+                    key, value = key.squeeze(0).permute(1, 0, 2), value.squeeze(0).permute(1, 0, 2)
                     self.kv_cache.reshape_and_cache(key, value, slot_mapping)
         else:
             # Decoding (auto-regressive generation)
-            if seq_id is None:
-                raise ValueError("seq_id must be provided for decoding")
+            if slot_mapping is None:
+                raise ValueError("slot_mapping must be provided for decoding")
 
-            # Get the cached key-value pairs
-            key_caches, value_caches = self.kv_cache.get_kv_cache(seq_id)
+            # Get the cached key-value pairs for this sequence
+            key_cache, value_cache = self.kv_cache.get_kv_cache(seq_id)
+
+            # Reshape key_cache and value_cache to match GPT2LMHeadModel expectations
+            num_blocks, num_heads, head_size_over_x, block_size, x = key_cache.shape
+            head_size = head_size_over_x * x
             
-            # Prepare block tables and sequence lengths
-            if block_tables is None:
-                block_tables = torch.tensor([self.kv_cache.allocated_blocks[seq_id]], dtype=torch.long, device='cuda')
-            if seq_lens is None:
-                seq_lens = torch.tensor([seq_len], dtype=torch.long, device='cuda')
-            if max_seq_len is None:
-                max_seq_len = seq_len
+            key_cache = key_cache.permute(0, 3, 1, 2, 4).reshape(num_blocks * block_size, num_heads, head_size)
+            value_cache = value_cache.permute(0, 3, 1, 2).reshape(num_blocks * block_size, num_heads, head_size)
+            key_cache, value_cache = key_cache.unsqueeze(0), value_cache.unsqueeze(0)
+
+            key_cache, value_cache = key_cache.permute(0, 2, 1, 3), value_cache.permute(0, 2, 1, 3)
+            print("key_cache.shape:", key_cache.shape)
+            print("value_cache.shape:", value_cache.shape)
+
+
+            # Prepare inputs for paged attention
+            block_tables = torch.tensor([self.kv_cache.allocated_blocks[seq_id]], dtype=torch.long, device=self.device)
+            seq_lens = torch.tensor([seq_len], dtype=torch.long, device=self.device)
+            max_seq_len = self.kv_cache.num_blocks * self.kv_cache.block_size
 
             # Use paged attention for decoding
             output, presents = self.model(
@@ -63,8 +72,8 @@ class PagedAttention:
                 attention_mask=attention_mask,
                 use_cache=use_cache,
                 is_prefill=is_prefill,
-                key_caches=key_caches,
-                value_caches=value_caches,
+                key_caches=key_cache,
+                value_caches=value_cache,
                 block_tables=block_tables,
                 seq_lens=seq_lens,
                 max_seq_len=max_seq_len
@@ -73,13 +82,12 @@ class PagedAttention:
             # Cache the new key-value pair
             if use_cache:
                 for layer_idx, (key, value) in enumerate(presents):
-                    slot_mapping = torch.tensor([seq_len - 1], dtype=torch.long, device='cuda')
                     self.kv_cache.reshape_and_cache(key, value, slot_mapping)
 
         return output
 
-    def swap_blocks(self, seq_id: int, new_block_mapping: List[Tuple[int, int]]):
-        block_mapping = torch.tensor(new_block_mapping, dtype=torch.long, device='cuda')
+    def copy_blocks(self, seq_id: int, new_block_mapping: List[Tuple[int, int]]):
+        block_mapping = torch.tensor(new_block_mapping, dtype=torch.long, device=self.device)
         self.kv_cache.copy_blocks(block_mapping)
 
         # Update the sequence's logical blocks
@@ -90,3 +98,6 @@ class PagedAttention:
         # Update free blocks
         self.kv_cache.free_blocks.extend(old_blocks)
         self.kv_cache.free_blocks = list(set(self.kv_cache.free_blocks) - set(new_blocks))
+
+    def free_memory(self, seq_id: int):
+        self.kv_cache.free(seq_id)

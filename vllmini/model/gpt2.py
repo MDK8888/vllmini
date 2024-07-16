@@ -15,7 +15,8 @@ class GPT2Attention(nn.Module):
         self.c_attn = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=True)
         self.c_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
 
-        self.block_size = 16  # You may want to make this configurable
+        self.block_size = 16  # This can be made configurable
+        self.max_blocks = 1024  # This can be made configurable
 
     def forward(
         self,
@@ -31,48 +32,41 @@ class GPT2Attention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         batch_size, seq_len, _ = hidden_states.shape
         qkv = self.c_attn(hidden_states)
-        query, key, value = qkv.split(self.hidden_size, dim=-1)
+        q, k, v = qkv.split(self.hidden_size, dim=-1)
 
-        query = query.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
-        key = key.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
-        value = value.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         if is_prefill:
-            attn_output = self._vanilla_attention(query, key, value, attention_mask)
+            attn_output = self._vanilla_attention(q, k, v, attention_mask)
         else:
-            key_cache = torch.cat([key_cache, key], dim=-2)
-            value_cache = torch.cat([value_cache, value], dim=-2)
-            attn_output = self._paged_attention(query, key_cache, value_cache, block_tables, seq_lens, max_seq_len)
+            attn_output = self._paged_attention(q, key_cache, value_cache, block_tables, seq_lens, max_seq_len)
 
-        present = (key, value) if use_cache else None
-
-        attn_output = attn_output.transpose(1, 2).contiguous().view(hidden_states.size())
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
         attn_output = self.c_proj(attn_output)
 
-        return attn_output, present
+        if use_cache:
+            return attn_output, (k, v)
+        return attn_output, None
 
-    def _vanilla_attention(self, query, key, value, attention_mask):
-        attn_weights = torch.matmul(query, key.transpose(-1, -2)) * self.scale
+    def _vanilla_attention(self, q, k, v, attention_mask):
+        attn_weights = torch.matmul(q, k.transpose(-1, -2)) * self.scale
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-        return torch.matmul(attn_weights, value)
+        return torch.matmul(attn_weights, v)
 
-    def _paged_attention(self, query, key_cache, value_cache, block_tables, seq_lens, max_seq_len):
-        query = query.squeeze(-2)
-        out = torch.empty_like(query)
-        print("query.shape:", query.shape)
-        print("query dtype:", query.dtype)
-        print("key_cache.shape:", key_cache.shape)
-        print("key_cache.dtype:", key_cache.dtype)
-        print("value_cache.shape:", value_cache.shape)
-        print("value_cache.dtype:", value_cache.dtype)
-        print("block_tables.shape:", block_tables.shape)
-        print("block_tables.dtype:", block_tables.dtype)
+    def _paged_attention(self, q, key_cache, value_cache, block_tables, seq_lens, max_seq_len):
+        batch_size, num_heads, seq_len, head_dim = q.shape
+        out = torch.empty_like(q)
+
+        # Reshape for paged attention kernel
+        q = q.contiguous().view(batch_size * num_heads, seq_len, head_dim)
 
         paged_attention_v1(
-            out,
-            query,
+            out.view(batch_size * num_heads, seq_len, head_dim),
+            q,
             key_cache,
             value_cache,
             self.num_heads,
@@ -81,16 +75,16 @@ class GPT2Attention(nn.Module):
             seq_lens,
             self.block_size,
             max_seq_len,
-            None,
+            None,  # alibi_slopes
             "auto",
-            1.0,
-            0,
-            0,
-            1,
-            1,
-            0
+            1.0,  # kv_scale
+            0,  # tp_rank
+            0,  # blocksparse_local_blocks
+            1,  # blocksparse_vert_stride
+            1,  # blocksparse_block_size
+            0,  # blocksparse_head_sliding_step
         )
-        return out.unsqueeze(-2)
+        return out
 
 class GPT2MLP(nn.Module):
     def __init__(self, config: GPT2Config):
@@ -177,6 +171,7 @@ class GPT2Model(nn.Module):
         for i, block in enumerate(self.h):
             key_cache = key_caches[i] if key_caches is not None else None
             value_cache = value_caches[i] if value_caches is not None else None
+            layer_block_tables = block_tables[i] if block_tables is not None else None
 
             hidden_states, present = block(
                 hidden_states,
@@ -185,7 +180,7 @@ class GPT2Model(nn.Module):
                 is_prefill=is_prefill,
                 key_cache=key_cache,
                 value_cache=value_cache,
-                block_tables=block_tables,
+                block_tables=layer_block_tables,
                 seq_lens=seq_lens,
                 max_seq_len=max_seq_len,
             )
@@ -204,6 +199,36 @@ class GPT2LMHeadModel(nn.Module):
         self.transformer = GPT2Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.lm_head.weight = self.transformer.wte.weight
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        use_cache: bool = True,
+        is_prefill: bool = True,
+        key_caches: Optional[List[torch.Tensor]] = None,
+        value_caches: Optional[List[torch.Tensor]] = None,
+        block_tables: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        max_seq_len: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
+        hidden_states, presents = self.transformer(
+            input_ids,
+            position_ids,
+            attention_mask=attention_mask,
+            use_cache=use_cache,
+            is_prefill=is_prefill,
+            key_caches=key_caches,
+            value_caches=value_caches,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+        )
+
+        lm_logits = self.lm_head(hidden_states)
+
+        return lm_logits, presents
 
     def load_huggingface_weights(self, model_name_or_path: str):
         from transformers import GPT2LMHeadModel as HFModel
@@ -261,33 +286,3 @@ class GPT2LMHeadModel(nn.Module):
             print(f"Warning: Unexpected keys: {unexpected_keys}")
 
         print("Weights loaded successfully")
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        use_cache: bool = True,
-        is_prefill: bool = True,
-        key_caches: Optional[List[torch.Tensor]] = None,
-        value_caches: Optional[List[torch.Tensor]] = None,
-        block_tables: Optional[torch.Tensor] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        max_seq_len: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
-        hidden_states, presents = self.transformer(
-            input_ids,
-            position_ids,
-            attention_mask=attention_mask,
-            use_cache=use_cache,
-            is_prefill=is_prefill,
-            key_caches=key_caches,
-            value_caches=value_caches,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_seq_len=max_seq_len,
-        )
-
-        lm_logits = self.lm_head(hidden_states)
-
-        return lm_logits, presents

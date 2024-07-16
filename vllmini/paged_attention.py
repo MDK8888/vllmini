@@ -39,13 +39,13 @@ class PagedAttention:
                     key, value = key.squeeze(0).permute(1, 0, 2), value.squeeze(0).permute(1, 0, 2)
                     self.kv_cache.reshape_and_cache(layer_idx, key, value, slot_mapping)
         else:
+            print("decoding...")
             # Decoding (auto-regressive generation)
             if slot_mapping is None:
                 raise ValueError("slot_mapping must be provided for decoding")
 
             # Get the cached key-value pairs for this sequence
             key_caches, value_caches = self.kv_cache.get_kv_cache(seq_id)
-
             # Reshape key_caches and value_caches to match GPT2LMHeadModel expectations
             reshaped_key_caches = []
             reshaped_value_caches = []
@@ -57,7 +57,9 @@ class PagedAttention:
                 value_cache = value_cache.permute(0, 3, 1, 2).reshape(num_blocks * block_size, num_heads, head_size)
                 key_cache, value_cache = key_cache.unsqueeze(0), value_cache.unsqueeze(0)
                 key_cache, value_cache = key_cache.permute(0, 2, 1, 3), value_cache.permute(0, 2, 1, 3)
-                
+
+                print(key_cache.shape)
+                print(value_cache.shape)
                 reshaped_key_caches.append(key_cache)
                 reshaped_value_caches.append(value_cache)
 
@@ -65,7 +67,6 @@ class PagedAttention:
             block_tables = torch.tensor([self.kv_cache.allocated_blocks[seq_id]], dtype=torch.int32, device=self.device)
             seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=self.device)
             max_seq_len = self.kv_cache.num_blocks * self.kv_cache.block_size
-            print("inside of PagedAttention, doing forward pass now on raw model...")
             # Use paged attention for decoding
             output, presents = self.model(
                 input_ids,

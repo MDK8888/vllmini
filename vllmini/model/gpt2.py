@@ -61,6 +61,14 @@ class GPT2Attention(nn.Module):
     def _paged_attention(self, query, key_cache, value_cache, block_tables, seq_lens, max_seq_len):
         query = query.squeeze(-2)
         out = torch.empty_like(query)
+        print("query.shape:", query.shape)
+        print("query dtype:", query.dtype)
+        print("key_cache.shape:", key_cache.shape)
+        print("key_cache.dtype:", key_cache.dtype)
+        print("value_cache.shape:", value_cache.shape)
+        print("value_cache.dtype:", value_cache.dtype)
+        print("block_tables.shape:", block_tables.shape)
+        print("block_tables.dtype:", block_tables.dtype)
 
         paged_attention_v1(
             out,

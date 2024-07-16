@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from transformers import GPT2Config, GPT2LMHeadModel
 from typing import List, Optional, Tuple
-from paged_attention_cuda import paged_attention_v1
+from paged_attention_cuda import paged_attention_v1, cache_ops
 
 class GPT2Attention(nn.Module):
     def __init__(self, config: GPT2Config):
@@ -26,7 +26,8 @@ class GPT2Attention(nn.Module):
         is_prefill: bool = True,
         key_cache: Optional[torch.Tensor] = None,
         value_cache: Optional[torch.Tensor] = None,
-        block_tables: Optional[torch.Tensor] = None,
+        slot_mapping: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
         seq_lens: Optional[torch.Tensor] = None,
         max_seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
@@ -34,20 +35,36 @@ class GPT2Attention(nn.Module):
         qkv = self.c_attn(hidden_states)
         q, k, v = qkv.split(self.hidden_size, dim=-1)
 
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # Reshape q, k, v to [batch_size, seq_len, num_heads, head_dim]
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
 
         if is_prefill:
+            # For prefill, we need to transpose to [batch_size, num_heads, seq_len, head_dim]
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
             attn_output = self._vanilla_attention(q, k, v, attention_mask)
+            attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+            attn_output = self.c_proj(attn_output)
+            if use_cache:
+                return attn_output, (k, v)
+            return attn_output, None
         else:
-            attn_output = self._paged_attention(q, key_cache, value_cache, block_tables, seq_lens, max_seq_len)
+            # Cache the new key and value vectors
+            self._cache_kv(k, v, key_cache, value_cache, slot_mapping)
+            # For paged attention, we need to reshape q to [num_seqs, num_heads, head_dim]
+            q = q.view(-1, self.num_heads, self.head_dim)
+            attn_output = self._paged_attention(q, key_cache, value_cache, block_table, seq_lens, max_seq_len)
+            # Reshape attn_output back to [batch_size, seq_len, num_heads, head_dim]
+            attn_output = attn_output.view(batch_size, seq_len, self.num_heads, self.head_dim)
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
         attn_output = self.c_proj(attn_output)
 
         if use_cache:
-            return attn_output, (k, v)
+            return attn_output, (key_cache, value_cache)
         return attn_output, None
 
     def _vanilla_attention(self, q, k, v, attention_mask):
@@ -57,21 +74,30 @@ class GPT2Attention(nn.Module):
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
         return torch.matmul(attn_weights, v)
 
-    def _paged_attention(self, q, key_cache, value_cache, block_tables, seq_lens, max_seq_len):
-        batch_size, num_heads, seq_len, head_dim = q.shape
-        out = torch.empty_like(q)
-
-        # Reshape for paged attention kernel
-        q = q.contiguous().view(batch_size * num_heads, seq_len, head_dim)
-
-        paged_attention_v1(
-            out.view(batch_size * num_heads, seq_len, head_dim),
-            q,
+    def _cache_kv(self, k: torch.Tensor, v: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor, slot_mapping: torch.Tensor):
+        batch_size, seq_len, num_heads, head_dim = k.shape
+        cache_ops.reshape_and_cache(
+            k.view(-1, num_heads, head_dim),
+            v.view(-1, num_heads, head_dim),
             key_cache,
             value_cache,
-            self.num_heads,
+            slot_mapping,
+            "auto",  # kv_cache_dtype
+            1.0,  # kv_scale
+        )
+
+    def _paged_attention(self, q, key_cache, value_cache, block_table, seq_lens, max_seq_len):
+        num_seqs, num_heads, head_dim = q.shape
+        out = torch.empty_like(q)
+
+        paged_attention_v1(
+            out,  # [num_seqs, num_heads, head_dim]
+            q,    # [num_seqs, num_heads, head_dim]
+            key_cache,
+            value_cache,
+            num_heads,
             self.scale,
-            block_tables,
+            block_table,
             seq_lens,
             self.block_size,
             max_seq_len,
@@ -84,6 +110,7 @@ class GPT2Attention(nn.Module):
             1,  # blocksparse_block_size
             0,  # blocksparse_head_sliding_step
         )
+        
         return out
 
 class GPT2MLP(nn.Module):
@@ -116,23 +143,28 @@ class GPT2Block(nn.Module):
         is_prefill: bool = True,
         key_cache: Optional[torch.Tensor] = None,
         value_cache: Optional[torch.Tensor] = None,
-        block_tables: Optional[torch.Tensor] = None,
+        slot_mapping: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
         seq_lens: Optional[torch.Tensor] = None,
         max_seq_len: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ):
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
-        attn_output, present = self.attn(
+        attn_outputs = self.attn(
             hidden_states,
             attention_mask=attention_mask,
             use_cache=use_cache,
             is_prefill=is_prefill,
             key_cache=key_cache,
             value_cache=value_cache,
-            block_tables=block_tables,
+            slot_mapping=slot_mapping,
+            block_table=block_table,
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
         )
+        attn_output = attn_outputs[0]
+        assert attn_output.shape == residual.shape, f"Your attention output doesn't match the residual. attn_output shape: {attn_output.shape}, residual shape: {residual.shape}"
+
         hidden_states = attn_output + residual
 
         residual = hidden_states
@@ -140,7 +172,11 @@ class GPT2Block(nn.Module):
         feed_forward_output = self.mlp(hidden_states)
         hidden_states = feed_forward_output + residual
 
-        return hidden_states, present
+        outputs = (hidden_states,)
+        if use_cache:
+            outputs += (attn_outputs[1],)
+
+        return outputs
 
 class GPT2Model(nn.Module):
     def __init__(self, config: GPT2Config):
@@ -158,35 +194,39 @@ class GPT2Model(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         use_cache: bool = True,
         is_prefill: bool = True,
-        key_caches: Optional[List[torch.Tensor]] = None,
-        value_caches: Optional[List[torch.Tensor]] = None,
-        block_tables: Optional[torch.Tensor] = None,
+        key_cache: Optional[torch.Tensor] = None,
+        value_cache: Optional[torch.Tensor] = None,
+        slot_mappings: Optional[List[torch.Tensor]] = None,
+        block_tables: Optional[List[torch.Tensor]] = None,
         seq_lens: Optional[torch.Tensor] = None,
         max_seq_len: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
+    ):
+        batch_size, seq_length = input_ids.size()
+
         hidden_states = self.wte(input_ids) + self.wpe(position_ids)
 
-        presents = [] if use_cache else None
+        presents = () if use_cache else None
 
         for i, block in enumerate(self.h):
-            key_cache = key_caches[i] if key_caches is not None else None
-            value_cache = value_caches[i] if value_caches is not None else None
-            layer_block_tables = block_tables[i] if block_tables is not None else None
+            slot_mapping = slot_mappings[i] if slot_mappings is not None else None
+            block_table = block_tables[i] if block_tables is not None else None
 
-            hidden_states, present = block(
+            outputs = block(
                 hidden_states,
                 attention_mask=attention_mask,
                 use_cache=use_cache,
                 is_prefill=is_prefill,
                 key_cache=key_cache,
                 value_cache=value_cache,
-                block_tables=layer_block_tables,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
                 seq_lens=seq_lens,
                 max_seq_len=max_seq_len,
             )
 
+            hidden_states = outputs[0]
             if use_cache:
-                presents.append(present)
+                presents += (outputs[1],)
 
         hidden_states = self.ln_f(hidden_states)
 
@@ -207,28 +247,31 @@ class GPT2LMHeadModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         use_cache: bool = True,
         is_prefill: bool = True,
-        key_caches: Optional[List[torch.Tensor]] = None,
-        value_caches: Optional[List[torch.Tensor]] = None,
-        block_tables: Optional[torch.Tensor] = None,
+        key_cache: Optional[torch.Tensor] = None,
+        value_cache: Optional[torch.Tensor] = None,
+        slot_mappings: Optional[List[torch.Tensor]] = None,
+        block_tables: Optional[List[torch.Tensor]] = None,
         seq_lens: Optional[torch.Tensor] = None,
         max_seq_len: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
-        hidden_states, presents = self.transformer(
+    ):
+        transformer_outputs = self.transformer(
             input_ids,
-            position_ids,
+            position_ids=position_ids,
             attention_mask=attention_mask,
             use_cache=use_cache,
             is_prefill=is_prefill,
-            key_caches=key_caches,
-            value_caches=value_caches,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            slot_mappings=slot_mappings,
             block_tables=block_tables,
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
         )
+        hidden_states = transformer_outputs[0]
 
         lm_logits = self.lm_head(hidden_states)
 
-        return lm_logits, presents
+        return lm_logits, transformer_outputs[1] if use_cache else None
 
     def load_huggingface_weights(self, model_name_or_path: str):
         from transformers import GPT2LMHeadModel as HFModel

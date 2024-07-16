@@ -1,3 +1,4 @@
+import pdb
 from typing import List, Tuple, Optional
 import torch
 from transformers import GPT2Config
@@ -21,7 +22,7 @@ class PagedAttention:
                 is_prefill: bool = True,
                 seq_id: int = -1,
                 slot_mapping: Optional[torch.Tensor] = None):
-        
+
         batch_size, seq_len = input_ids.shape
 
         if is_prefill:
@@ -64,7 +65,7 @@ class PagedAttention:
             block_tables = torch.tensor([self.kv_cache.allocated_blocks[seq_id]], dtype=torch.int32, device=self.device)
             seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=self.device)
             max_seq_len = self.kv_cache.num_blocks * self.kv_cache.block_size
-
+            print("inside of PagedAttention, doing forward pass now on raw model...")
             # Use paged attention for decoding
             output, presents = self.model(
                 input_ids,

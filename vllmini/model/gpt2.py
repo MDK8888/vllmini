@@ -35,32 +35,33 @@ class GPT2Attention(nn.Module):
         qkv = self.c_attn(hidden_states)
         q, k, v = qkv.split(self.hidden_size, dim=-1)
 
-        # Reshape q, k, v to [batch_size, seq_len, num_heads, head_dim]
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        # Reshape q, k, v to [batch_size * seq_len, num_heads, head_dim]
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_heads, self.head_dim)
+        v = v.view(-1, self.num_heads, self.head_dim)
+
+        # Always cache k and v using the reshape_and_cache kernel
+        self._cache_kv(k, v, key_cache, value_cache, slot_mapping)
 
         if is_prefill:
-            # For prefill, we need to transpose to [batch_size, num_heads, seq_len, head_dim]
+            # For prefill, we need to use the attention mask and perform full attention
+            # Reshape q, k, v back to [batch_size, seq_len, num_heads, head_dim]
+            q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+            k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
+            v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
+            
+            # Transpose to [batch_size, num_heads, seq_len, head_dim]
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
+            
             attn_output = self._vanilla_attention(q, k, v, attention_mask)
             attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
-            attn_output = self.c_proj(attn_output)
-            if use_cache:
-                return attn_output, (k, v)
-            return attn_output, None
         else:
-            # Cache the new key and value vectors
-            self._cache_kv(k, v, key_cache, value_cache, slot_mapping)
-            # For paged attention, we need to reshape q to [num_seqs, num_heads, head_dim]
-            q = q.view(-1, self.num_heads, self.head_dim)
+            # For decoding, use paged attention
             attn_output = self._paged_attention(q, key_cache, value_cache, block_table, seq_lens, max_seq_len)
-            # Reshape attn_output back to [batch_size, seq_len, num_heads, head_dim]
-            attn_output = attn_output.view(batch_size, seq_len, self.num_heads, self.head_dim)
+            attn_output = attn_output.view(batch_size, seq_len, self.hidden_size)
 
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
         attn_output = self.c_proj(attn_output)
 
         if use_cache:
@@ -75,10 +76,9 @@ class GPT2Attention(nn.Module):
         return torch.matmul(attn_weights, v)
 
     def _cache_kv(self, k: torch.Tensor, v: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor, slot_mapping: torch.Tensor):
-        batch_size, seq_len, num_heads, head_dim = k.shape
         cache_ops.reshape_and_cache(
-            k.view(-1, num_heads, head_dim),
-            v.view(-1, num_heads, head_dim),
+            k,
+            v,
             key_cache,
             value_cache,
             slot_mapping,
@@ -95,7 +95,7 @@ class GPT2Attention(nn.Module):
             q,    # [num_seqs, num_heads, head_dim]
             key_cache,
             value_cache,
-            num_heads,
+            self.num_heads,
             self.scale,
             block_table,
             seq_lens,

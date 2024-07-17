@@ -168,11 +168,14 @@ __global__ void reshape_and_cache_kernel(
     return;
   }
 
+  //ok, let's analyze this kernel. First, we launch as many blocks as there are tokens. 
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
 
-  const int n = num_heads * head_size;
-  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+  //next, the block_size is going to be 16. Therefore, if we just do slot_idx / block_size, this is going to be 0, and block_offset = slot_idx.
+
+  const int n = num_heads * head_size; //what does this n variable represent? 
+  for (int i = threadIdx.x; i < n; i += blockDim.x) { //there are min(512, num_heads * head_size) threads per block.
     const int64_t src_key_idx = token_idx * key_stride + i;
     const int64_t src_value_idx = token_idx * value_stride + i;
 

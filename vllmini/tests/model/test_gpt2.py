@@ -3,11 +3,22 @@ import unittest
 from vllmini.model.gpt2 import GPT2LMHeadModel
 from transformers import GPT2Tokenizer, GPT2Config
 
+def generate_triangular_mask(batch_size, num_heads, seq_len):
+    # Create an upper triangular matrix with -inf, including the diagonal
+    upper_triangular = torch.triu(torch.full((seq_len, seq_len), float('-inf')), diagonal=1)
+    
+    # Expand the upper triangular matrix to match the desired shape
+    mask = upper_triangular.unsqueeze(0).unsqueeze(0)  # shape (1, 1, seq_len, seq_len)
+    mask = mask.expand(batch_size, num_heads, seq_len, seq_len)  # shape (batch_size, num_heads, seq_len, seq_len)
+    
+    return mask
+
 class TestGPT2WithPagedAttention(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.config = GPT2Config.from_pretrained('gpt2')
         cls.model = GPT2LMHeadModel(cls.config)
+        cls.model.load_huggingface_weights("gpt2")
         cls.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cls.model.to(cls.device)
@@ -57,7 +68,6 @@ class TestGPT2WithPagedAttention(unittest.TestCase):
     def test_prefill_and_decode_one_token(self):
         input_text = "Hello, how"
         input_ids = self.tokenizer.encode(input_text, return_tensors="pt").to(self.device)
-        attention_mask = torch.ones_like(input_ids)
         position_ids = torch.arange(0, input_ids.size(1), dtype=torch.long).unsqueeze(0).to(self.device)
 
         # Prepare cache tensors
@@ -67,6 +77,9 @@ class TestGPT2WithPagedAttention(unittest.TestCase):
         head_size = self.config.hidden_size // num_heads
         block_size = self.model.transformer.h[0].attn.block_size
         num_blocks = 1024
+
+        attention_mask = generate_triangular_mask(1, num_heads, seq_len)
+        attention_mask = attention_mask.to(self.device)
 
         key_cache = torch.zeros(num_blocks, num_heads, head_size // 8, block_size, 8, dtype=torch.float16, device=self.device)
         value_cache = torch.zeros(num_blocks, num_heads, head_size, block_size, dtype=torch.float16, device=self.device)
@@ -88,6 +101,9 @@ class TestGPT2WithPagedAttention(unittest.TestCase):
                 value_cache=value_cache,
                 slot_mappings=slot_mapping
             )
+
+        print("logits:", prefill_outputs[0])
+        print("logits shape:", prefill_outputs[0].shape)
 
         self.assertIsNotNone(prefill_outputs[0])  # Check if logits are produced
         self.assertIsNotNone(prefill_outputs[1])  # Check if key-value cache is produced

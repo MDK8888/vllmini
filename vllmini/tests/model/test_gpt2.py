@@ -102,9 +102,6 @@ class TestGPT2WithPagedAttention(unittest.TestCase):
                 slot_mappings=slot_mapping
             )
 
-        print("logits:", prefill_outputs[0])
-        print("logits shape:", prefill_outputs[0].shape)
-
         self.assertIsNotNone(prefill_outputs[0])  # Check if logits are produced
         self.assertIsNotNone(prefill_outputs[1])  # Check if key-value cache is produced
         self.assertEqual(len(prefill_outputs[1]), self.config.num_hidden_layers)  # Check if cache is produced for all layers
@@ -131,8 +128,8 @@ class TestGPT2WithPagedAttention(unittest.TestCase):
 
         # Prepare block tables
         block_tables = []
-        for _ in range(num_layers):
-            block_table = torch.zeros(1).unsqueeze(0).to(dtype=torch.int32, device=self.device)
+        for i in range(num_layers):
+            block_table = torch.tensor([i]).unsqueeze(0).to(dtype=torch.int32, device=self.device)
             block_tables.append(block_table)
 
         # Prepare sequence lengths

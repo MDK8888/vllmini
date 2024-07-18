@@ -1,0 +1,103 @@
+import time
+from typing import Dict, Tuple, List
+import torch
+from .kv_cache import KVCache
+
+class BlockManager:
+    def __init__(self, num_blocks: int, block_size: int, num_heads: int, head_size: int):
+        self.num_blocks = num_blocks
+        self.block_size = block_size
+        self.num_heads = num_heads
+        self.head_size = head_size
+
+        self.kv_cache = KVCache(num_blocks, num_heads, head_size, block_size)
+        self.cpu_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self.sequence_groups: Dict[int, List[int]] = {}  # group_id: [seq_id1, seq_id2, ...]
+
+    def allocate_for_prefill(self, group_id: int, num_layers: int, seq_len: int) -> Tuple[int, List[int], List[torch.Tensor], List[List[int]]]:
+        seq_id = self._generate_seq_id()
+        self.sequence_groups[group_id] = [seq_id]
+        
+        allocated, slot_mappings, paged_attention_block_table = self.kv_cache.allocate_for_prefill(seq_id, num_layers, seq_len)
+        return seq_id, allocated, slot_mappings, paged_attention_block_table
+
+    def get_block_table(self, seq_id: int) -> List[Tuple[int, int]]:
+        return self.kv_cache.get_block_table(seq_id)
+
+    def get_paged_attention_block_table(self, seq_id: int) -> List[List[int]]:
+        return self.kv_cache.get_paged_attention_block_table(seq_id)
+
+    def get_kv_cache(self, seq_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.kv_cache.get_kv_cache(seq_id)
+
+    def decode_step(self, seq_id: int, input_len: int) -> Tuple[List[List[int]], torch.Tensor]:
+        block_table = self.kv_cache.get_block_table(seq_id)
+        paged_attention_block_table = self.kv_cache.get_paged_attention_block_table(seq_id)
+        
+        new_slot_mapping = []
+        for layer_idx, layer_blocks in enumerate(paged_attention_block_table):
+            last_block = layer_blocks[-1]
+            last_block_info = next(block_info for block_info in block_table if block_info[0] == last_block)
+            _, num_filled = last_block_info
+
+            if num_filled == self.block_size:
+                # Current block is full, append a new one
+                new_block = self.kv_cache.append_block(seq_id, layer_idx)
+                last_block = new_block
+                num_filled = 0
+
+            new_slot = last_block * self.block_size + num_filled
+            new_slot_mapping.append(new_slot)
+            
+            # Update the block table with the new number of filled slots
+            self.kv_cache.update_block_table(seq_id, last_block, num_filled + input_len)
+
+        return paged_attention_block_table, torch.tensor(new_slot_mapping, dtype=torch.long, device='cuda')
+
+    def free(self, group_id: int):
+        if group_id in self.sequence_groups:
+            for seq_id in self.sequence_groups[group_id]:
+                self.kv_cache.free(seq_id)
+                if seq_id in self.cpu_cache:
+                    del self.cpu_cache[seq_id]
+            del self.sequence_groups[group_id]
+
+    def swap_to_cpu(self, group_id: int):
+        if group_id not in self.sequence_groups:
+            raise ValueError(f"No sequence group with id {group_id}")
+
+        for seq_id in self.sequence_groups[group_id]:
+            key_cache, value_cache = self.kv_cache.get_kv_cache(seq_id)
+            self.cpu_cache[seq_id] = (key_cache.cpu(), value_cache.cpu())
+            self.kv_cache.free(seq_id)
+
+    def swap_from_cpu(self, group_id: int) -> bool:
+        if group_id not in self.sequence_groups:
+            raise ValueError(f"No sequence group with id {group_id}")
+
+        success = True
+        for seq_id in self.sequence_groups[group_id]:
+            if seq_id in self.cpu_cache:
+                cpu_key_cache, cpu_value_cache = self.cpu_cache[seq_id]
+                try:
+                    allocated = self.kv_cache.allocate(seq_id, cpu_key_cache.size(0))
+                    key_cache, value_cache = self.kv_cache.get_kv_cache(seq_id)
+                    key_cache.copy_(cpu_key_cache.cuda())
+                    value_cache.copy_(cpu_value_cache.cuda())
+                    del self.cpu_cache[seq_id]
+                except RuntimeError:
+                    success = False
+                    break
+
+        if not success:
+            # Rollback: swap back to CPU any sequences that were swapped to GPU
+            for seq_id in self.sequence_groups[group_id]:
+                if seq_id not in self.cpu_cache:
+                    key_cache, value_cache = self.kv_cache.get_kv_cache(seq_id)
+                    self.cpu_cache[seq_id] = (key_cache.cpu(), value_cache.cpu())
+                    self.kv_cache.free(seq_id)
+
+        return success
+
+    def _generate_seq_id(self) -> int:
+        return int(time.time() * 1000000)

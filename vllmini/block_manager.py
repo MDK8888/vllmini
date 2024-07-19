@@ -4,13 +4,13 @@ import torch
 from .kv_cache import KVCache
 
 class BlockManager:
-    def __init__(self, num_blocks: int, block_size: int, num_heads: int, head_size: int):
+    def __init__(self, num_blocks: int, block_size: int, num_heads: int, head_size: int, max_blocks_per_seq:int):
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.num_heads = num_heads
         self.head_size = head_size
 
-        self.kv_cache = KVCache(num_blocks, num_heads, head_size, block_size)
+        self.kv_cache = KVCache(num_blocks, num_heads, head_size, block_size, max_blocks_per_seq)
         self.cpu_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self.sequence_groups: Dict[int, List[int]] = {}  # group_id: [seq_id1, seq_id2, ...]
 
@@ -33,26 +33,38 @@ class BlockManager:
     def decode_step(self, seq_id: int, input_len: int) -> Tuple[List[List[int]], torch.Tensor]:
         block_table = self.kv_cache.get_block_table(seq_id)
         paged_attention_block_table = self.kv_cache.get_paged_attention_block_table(seq_id)
-        
+
         new_slot_mapping = []
         for layer_idx, layer_blocks in enumerate(paged_attention_block_table):
-            last_block = layer_blocks[-1]
-            last_block_info = next(block_info for block_info in block_table if block_info[0] == last_block)
+            last_block = -1
+            for i in range(len(layer_blocks[0])):
+                if layer_blocks[0][i] != -1:
+                    last_block = layer_blocks[0][i]
+                    break
+            
+            for (block, filled) in block_table:
+                if block == last_block:
+                    last_block_info = (block, filled)
+                    break
+            
             _, num_filled = last_block_info
 
             if num_filled == self.block_size:
+                print("in BlockManager.decode_step, block is full, we need to search for new block.")
                 # Current block is full, append a new one
                 new_block = self.kv_cache.append_block(seq_id, layer_idx)
                 last_block = new_block
                 num_filled = 0
 
             new_slot = last_block * self.block_size + num_filled
-            new_slot_mapping.append(new_slot)
+            new_slot_mapping.append(torch.tensor([new_slot], dtype=torch.long, device="cuda"))
             
             # Update the block table with the new number of filled slots
             self.kv_cache.update_block_table(seq_id, last_block, num_filled + input_len)
 
-        return paged_attention_block_table, torch.tensor(new_slot_mapping, dtype=torch.long, device='cuda')
+        paged_attention_block_table = self.kv_cache.get_paged_attention_block_table(seq_id)        
+
+        return paged_attention_block_table, new_slot_mapping
 
     def free(self, group_id: int):
         if group_id in self.sequence_groups:

@@ -89,7 +89,6 @@ class GPT2Attention(nn.Module):
     def _paged_attention(self, q, key_cache, value_cache, block_table, seq_lens, max_seq_len):
         num_seqs, num_heads, head_dim = q.shape
         out = torch.empty_like(q)
-
         paged_attention_v1(
             out,  # [num_seqs, num_heads, head_dim]
             q,    # [num_seqs, num_heads, head_dim]
@@ -172,9 +171,9 @@ class GPT2Block(nn.Module):
         feed_forward_output = self.mlp(hidden_states)
         hidden_states = feed_forward_output + residual
 
-        outputs = (hidden_states,)
+        outputs = hidden_states
         if use_cache:
-            outputs += (attn_outputs[1],)
+            outputs = (outputs, attn_outputs[1])
 
         return outputs
 
@@ -204,14 +203,13 @@ class GPT2Model(nn.Module):
         batch_size, seq_length = input_ids.size()
 
         hidden_states = self.wte(input_ids) + self.wpe(position_ids)
-
         presents = () if use_cache else None
 
         for i, block in enumerate(self.h):
             slot_mapping = slot_mappings[i] if slot_mappings is not None else None
             block_table = block_tables[i] if block_tables is not None else None
 
-            outputs = block(
+            outputs, kv_cache = block(
                 hidden_states,
                 attention_mask=attention_mask,
                 use_cache=use_cache,
@@ -224,9 +222,11 @@ class GPT2Model(nn.Module):
                 max_seq_len=max_seq_len,
             )
 
-            hidden_states = outputs[0]
+            key_cache, value_cache = kv_cache[0], kv_cache[1]
+
+            hidden_states = outputs[0].unsqueeze(0)
             if use_cache:
-                presents += (outputs[1],)
+                presents = (key_cache, value_cache)
 
         hidden_states = self.ln_f(hidden_states)
 

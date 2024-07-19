@@ -3,11 +3,12 @@ import time
 from typing import Dict, List, Tuple
 
 class KVCache:
-    def __init__(self, num_blocks: int, num_heads: int, head_size: int, block_size: int):
+    def __init__(self, num_blocks: int, num_heads: int, head_size: int, block_size: int, max_blocks_per_seq:int):
         self.num_blocks = num_blocks
         self.num_heads = num_heads
         self.head_size = head_size
         self.block_size = block_size
+        self.max_blocks_per_seq = max_blocks_per_seq
 
         self.key_cache = torch.zeros(num_blocks, num_heads, head_size // 8, block_size, 8, dtype=torch.float16, device='cuda')
         self.value_cache = torch.zeros(num_blocks, num_heads, head_size, block_size, dtype=torch.float16, device='cuda')
@@ -27,7 +28,8 @@ class KVCache:
         
         # Initialize both block tables
         self.block_tables[seq_id] = [(block, min(seq_len, self.block_size)) for block in allocated]
-        self.paged_attention_block_tables[seq_id] = [[block] for block in allocated]
+        self.paged_attention_block_tables[seq_id] = [torch.tensor([[block] + [-1] * (self.max_blocks_per_seq - 1)], device="cuda", dtype=torch.int32) \
+                                                     for block in allocated]
 
         # Calculate slot mappings based on allocated blocks
         slot_mappings = [torch.arange(seq_len, dtype=torch.long, device='cuda') + block * self.block_size for block in allocated]
@@ -60,7 +62,13 @@ class KVCache:
         
         # Update both block tables
         self.block_tables[seq_id].append((new_block, 0))
-        self.paged_attention_block_tables[seq_id][layer_idx].append(new_block)
+        new_block_index = 0
+        for i in range(self.max_blocks_per_seq):
+            if self.paged_attention_block_tables[seq_id][layer_idx][0][i] == -1:
+                new_block_index = i
+                break
+
+        self.paged_attention_block_tables[seq_id][layer_idx][0][new_block_index] = new_block
 
         return new_block
 

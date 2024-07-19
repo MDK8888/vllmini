@@ -37,9 +37,9 @@ class BlockManager:
         new_slot_mapping = []
         for layer_idx, layer_blocks in enumerate(paged_attention_block_table):
             last_block = -1
-            for i in range(len(layer_blocks[0])):
-                if layer_blocks[0][i] != -1:
-                    last_block = layer_blocks[0][i]
+            for i in range(1, len(layer_blocks[0])):
+                if layer_blocks[0][i] == -1:
+                    last_block = layer_blocks[0][i-1]
                     break
             
             for (block, filled) in block_table:

@@ -85,7 +85,7 @@ class TestKVCacheAndBlockManager(unittest.TestCase):
                 seq_lens=torch.tensor([generated.size(1)], dtype=torch.int32, device="cuda"),
                 max_seq_len=self.max_blocks_per_seq
             )
-            
+
             key_cache, value_cache = kv_cache[0], kv_cache[1]
             
             next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
@@ -93,6 +93,7 @@ class TestKVCacheAndBlockManager(unittest.TestCase):
             
             print(f"Step {i+1}:")
             print(f"Generated token: {self.tokenizer.decode(next_token.item())}")
+            print(f"logits: {logits}")
             print("---")
         
         generated_text = self.tokenizer.decode(generated[0])

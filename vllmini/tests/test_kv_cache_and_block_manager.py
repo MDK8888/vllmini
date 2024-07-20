@@ -105,25 +105,28 @@ class TestKVCacheAndBlockManager(unittest.TestCase):
         # Decoding phase
         paged_attention_block_table, new_slot_mappings = self.block_manager.decode_step(seq_id, 1)
         
-        logits, _ = self.model(
-            input_ids=next_token,
-            position_ids=torch.tensor([generated.size(1) - 1], device="cuda"),
-            attention_mask=None,
-            use_cache=True,
-            is_prefill=False,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            slot_mappings=new_slot_mappings,
-            block_tables=paged_attention_block_table,
-            seq_lens=torch.tensor([generated.size(1) - 1], dtype=torch.int32, device="cuda"),
-            max_seq_len=self.max_blocks_per_seq
-        )
-        
-        next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
-        generated = torch.cat([generated, next_token], dim=1)
+        for i in range(19):
+
+            paged_attention_block_table, new_slot_mappings = self.block_manager.decode_step(seq_id, 1)
+
+            logits, _ = self.model(
+                input_ids=next_token,
+                position_ids=torch.tensor([generated.size(1) - 1], device="cuda"),
+                attention_mask=None,
+                use_cache=True,
+                is_prefill=False,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                slot_mappings=new_slot_mappings,
+                block_tables=paged_attention_block_table,
+                seq_lens=torch.tensor([generated.size(1) - 1], dtype=torch.int32, device="cuda"),
+                max_seq_len=self.max_blocks_per_seq
+            )
+            
+            next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
+            generated = torch.cat([generated, next_token], dim=1)
         
         print("length of generated:", generated.size(1))
-
         generated_text = self.tokenizer.decode(generated[0])
         print(f"Full generated text: {generated_text}")
         

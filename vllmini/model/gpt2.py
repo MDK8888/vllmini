@@ -79,8 +79,8 @@ class GPT2Attention(nn.Module):
 
     def _cache_kv(self, k: torch.Tensor, v: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor, slot_mapping: torch.Tensor):
         cache_ops.reshape_and_cache(
-            k.half(),
-            v.half(),
+            k,
+            v,
             key_cache,
             value_cache,
             slot_mapping,
@@ -90,10 +90,10 @@ class GPT2Attention(nn.Module):
 
     def _paged_attention(self, q, key_cache, value_cache, block_table, seq_lens, max_seq_len):
         num_seqs, num_heads, head_dim = q.shape
-        out = torch.empty_like(q.half())
+        out = torch.empty_like(q)
         paged_attention_v1(
             out,  # [num_seqs, num_heads, head_dim]
-            q.half(),    # [num_seqs, num_heads, head_dim]
+            q,    # [num_seqs, num_heads, head_dim]
             key_cache,
             value_cache,
             self.num_heads,

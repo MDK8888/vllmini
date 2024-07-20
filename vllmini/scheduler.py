@@ -9,6 +9,7 @@ from vllmini.model.gpt2 import GPT2LMHeadModel
 class Scheduler:
     def __init__(self, model:GPT2LMHeadModel, block_manager:BlockManager, max_length: int):
         self.model = model
+        self.model = self.model.to(torch.float16)
         self.block_manager = block_manager
         self.max_length = max_length
         self.queue = PriorityQueue()
@@ -68,7 +69,7 @@ class Scheduler:
                 next_token = self.sample_next_token(seq_id)
                 
                 input_ids = next_token.unsqueeze(0).unsqueeze(0)
-                position_ids = torch.tensor([[self.sequence_lengths[seq_id]]], device=input_ids.device)
+                position_ids = torch.tensor([self.sequence_lengths[seq_id]], device=input_ids.device)
                 
                 paged_attention_block_table, new_slot_mappings = self.block_manager.decode_step(seq_id, 1)
                 key_cache, value_cache = self.block_manager.kv_cache.key_cache, self.block_manager.kv_cache.value_cache
@@ -84,7 +85,7 @@ class Scheduler:
                     slot_mappings=new_slot_mappings,
                     block_tables=paged_attention_block_table,
                     seq_lens=torch.tensor([self.sequence_lengths[seq_id]], dtype=torch.int32, device=input_ids.device),
-                    max_seq_len=self.block_manager.max_blocks_per_seq * self.block_manager.block_size
+                    max_seq_len=self.block_manager.kv_cache.max_blocks_per_seq * self.block_manager.block_size
                 )
 
                 self.last_logits[seq_id] = logits[:, -1, :]

@@ -120,7 +120,7 @@ class TestKVCacheAndBlockManager(unittest.TestCase):
                 slot_mappings=new_slot_mappings,
                 block_tables=paged_attention_block_table,
                 seq_lens=torch.tensor([generated.size(1) - 1], dtype=torch.int32, device="cuda"),
-                max_seq_len=self.max_blocks_per_seq
+                max_seq_len=self.max_blocks_per_seq * self.block_size
             )
             
             next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)

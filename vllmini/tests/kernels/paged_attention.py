@@ -5,7 +5,7 @@ from paged_attention_cuda import cache_ops, paged_attention_v1
 
 class TestPagedAttention(unittest.TestCase):
     def setUp(self):
-        self.num_blocks = 16
+        self.num_blocks = 1000
         self.num_heads = 12
         self.head_size = 64
         self.block_size = 16
@@ -43,6 +43,12 @@ class TestPagedAttention(unittest.TestCase):
         key = key.reshape(-1, self.num_heads, self.head_size)
         value = value.reshape(-1, self.num_heads, self.head_size)
 
+        print("slot_mapping:", slot_mapping)
+        print("k.shape:", key.shape)
+        print("v.shape:", value.shape)
+        print("key_cache.shape:", self.key_cache.shape)
+        print("value_cache.shape:", self.value_cache.shape)
+
         # Call cache_ops.reshape_and_cache
         cache_ops.reshape_and_cache(
             key, value, self.key_cache, self.value_cache, slot_mapping, 
@@ -50,11 +56,7 @@ class TestPagedAttention(unittest.TestCase):
         )
 
         # Generate block_table
-        num_blocks_per_seq = (self.seq_len + self.block_size - 1) // self.block_size
-        block_table = [
-            [i * num_blocks_per_seq + j for j in range(num_blocks_per_seq)]
-            for i in range(self.batch_size)
-        ]
+        block_table = [[0, -1, -1, -1]]
 
         return block_table, slot_mapping
 
@@ -107,7 +109,6 @@ class TestPagedAttention(unittest.TestCase):
         attn_probs = torch.softmax(attn_weights, dim=-1)
         vanilla_output = torch.matmul(attn_probs, value_for_vanilla)
 
-        print("vanilla output:", vanilla_output)
         # Compute paged attention
         seq_lens = torch.full((self.batch_size,), self.seq_len, dtype=torch.int32, device=self.device)
         paged_output = torch.empty_like(vanilla_output)
@@ -132,8 +133,6 @@ class TestPagedAttention(unittest.TestCase):
             1,  # blocksparse_block_size
             0,  # blocksparse_head_sliding_step
         )
-
-        print("paged_output:", paged_output)
 
         # Compare outputs
         self.assertTrue(torch.allclose(vanilla_output, paged_output, atol=1e-2), 

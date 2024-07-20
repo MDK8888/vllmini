@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from transformers import GPT2Config, GPT2LMHeadModel
+from transformers import GPT2Config
 from typing import List, Optional, Tuple
 from paged_attention_cuda import paged_attention_v1, cache_ops
 
@@ -72,6 +72,7 @@ class GPT2Attention(nn.Module):
         attn_weights = torch.matmul(q, k.transpose(-1, -2)) * self.scale
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
+
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
         return torch.matmul(attn_weights, v)
 
@@ -89,6 +90,11 @@ class GPT2Attention(nn.Module):
     def _paged_attention(self, q, key_cache, value_cache, block_table, seq_lens, max_seq_len):
         num_seqs, num_heads, head_dim = q.shape
         out = torch.empty_like(q)
+        print("query:", q)
+        print("block_table:", block_table)
+        print("seq_lens:", seq_lens)
+        print("block_size:", self.block_size)
+        print("max_seq_len:", max_seq_len)
         paged_attention_v1(
             out,  # [num_seqs, num_heads, head_dim]
             q,    # [num_seqs, num_heads, head_dim]
@@ -201,7 +207,6 @@ class GPT2Model(nn.Module):
         max_seq_len: Optional[int] = None,
     ):
         batch_size, seq_length = input_ids.size()
-
         hidden_states = self.wte(input_ids) + self.wpe(position_ids)
         presents = () if use_cache else None
 

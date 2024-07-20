@@ -91,7 +91,7 @@ class TestGPT2WithPagedAttention(unittest.TestCase):
             slot_mapping.append(layer_slot_mapping)
 
         with torch.no_grad():
-            prefill_outputs = self.model(
+            prefill_outputs, kv_cache = self.model(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
@@ -118,7 +118,7 @@ class TestGPT2WithPagedAttention(unittest.TestCase):
         generated_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
         # Decoding phase (one token)
         current_length = input_ids.size(1)
-        position_ids = torch.tensor([[current_length]], dtype=torch.long, device=self.device)
+        position_ids = torch.tensor([current_length], dtype=torch.long, device=self.device)
         
         # Prepare slot mapping for decoding
         slot_mapping = []
@@ -129,12 +129,13 @@ class TestGPT2WithPagedAttention(unittest.TestCase):
         # Prepare block tables
         block_tables = []
         for i in range(num_layers):
-            block_table = torch.tensor([i]).unsqueeze(0).to(dtype=torch.int32, device=self.device)
+            block_table = torch.tensor([i, -1, -1, -1]).unsqueeze(0).to(dtype=torch.int32, device=self.device)
             block_tables.append(block_table)
 
         # Prepare sequence lengths
         seq_lens = torch.tensor([current_length], dtype=torch.int32, device=self.device)
-
+        key_cache, value_cache = kv_cache[0], kv_cache[1]
+        
         with torch.no_grad():
             decode_outputs = self.model(
                 input_ids=next_token.unsqueeze(0),

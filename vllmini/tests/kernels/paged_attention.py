@@ -1,69 +1,143 @@
 import torch
-from paged_attention_cuda import paged_attention_v1
+import unittest
+from typing import Tuple, List
+from paged_attention_cuda import cache_ops, paged_attention_v1
 
-# Enable CUDA if available
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+class TestPagedAttention(unittest.TestCase):
+    def setUp(self):
+        self.num_blocks = 16
+        self.num_heads = 12
+        self.head_size = 64
+        self.block_size = 16
+        self.batch_size = 1
+        self.seq_len = 3
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Example dimensions
-num_seqs = 2
-num_heads = 4
-num_kv_heads = 2  # Can be different from num_heads for multi-query attention
-head_size = 64
-max_seq_len = 256
-block_size = 16
-num_blocks = 32  # Total number of blocks in the KV cache
+        # Allocate key and value caches
+        self.key_cache = torch.zeros(
+            self.num_blocks, self.num_heads, self.head_size // 8, self.block_size, 8, 
+            dtype=torch.float16, device=self.device
+        )
+        self.value_cache = torch.zeros(
+            self.num_blocks, self.num_heads, self.head_size, self.block_size, 
+            dtype=torch.float16, device=self.device
+        )
 
-# Create dummy tensors
-out = torch.zeros(num_seqs, num_heads, head_size, device=device)
-query = torch.randn(num_seqs, num_heads, head_size, device=device)
+    def generate_random_kv(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        key = torch.randn(
+            self.batch_size, self.seq_len, self.num_heads, self.head_size, 
+            dtype=torch.float16, device=self.device
+        )
+        value = torch.randn(
+            self.batch_size, self.seq_len, self.num_heads, self.head_size, 
+            dtype=torch.float16, device=self.device
+        )
+        return key, value
 
-# Key and value caches now use the paged structure
-key_cache = torch.randn(num_blocks, num_kv_heads, head_size//8, block_size, 8, device=device)
-value_cache = torch.randn(num_blocks, num_kv_heads, head_size, block_size, device=device)
+    def cache_and_reshape_kv(self, key: torch.Tensor, value: torch.Tensor) -> Tuple[List[int], torch.Tensor]:
+        # Generate slot_mapping
+        slot_mapping = torch.arange(self.seq_len, dtype=torch.long, device=self.device)
+        slot_mapping = slot_mapping.repeat(self.batch_size)
 
-# Block tables map sequence positions to block numbers
-# Each sequence can use a different number of blocks
-block_tables = torch.randint(0, num_blocks, (num_seqs, max_seq_len // block_size), dtype=torch.int32, device=device)
+        # Reshape key and value for cache_ops.reshape_and_cache
+        key = key.reshape(-1, self.num_heads, self.head_size)
+        value = value.reshape(-1, self.num_heads, self.head_size)
 
-# Sequence lengths (can be different for each sequence in the batch)
-seq_lens = torch.tensor([200, 150], dtype=torch.int32, device=device)
+        # Call cache_ops.reshape_and_cache
+        cache_ops.reshape_and_cache(
+            key, value, self.key_cache, self.value_cache, slot_mapping, 
+            "auto", 1.0  # kv_cache_dtype and kv_scale
+        )
 
-# Other parameters
-scale = 1.0 / (head_size ** 0.5)
-max_num_blocks_per_seq = max_seq_len // block_size
-kv_cache_dtype = "auto"
-kv_scale = 1.0
-tp_rank = 0
+        # Generate block_table
+        num_blocks_per_seq = (self.seq_len + self.block_size - 1) // self.block_size
+        block_table = [
+            [i * num_blocks_per_seq + j for j in range(num_blocks_per_seq)]
+            for i in range(self.batch_size)
+        ]
 
-# Set these to default values for vanilla attention
-blocksparse_local_blocks = 0
-blocksparse_vert_stride = 1
-blocksparse_block_size = 16
-blocksparse_head_sliding_step = 0
+        return block_table, slot_mapping
 
-try:
-    paged_attention_v1(
-        out, 
-        query, 
-        key_cache, 
-        value_cache, 
-        num_kv_heads, 
-        scale,
-        block_tables, 
-        seq_lens, 
-        block_size, 
-        max_seq_len, 
-        None,  # alibi_slopes set to None for vanilla attention
-        kv_cache_dtype, 
-        kv_scale, 
-        tp_rank, 
-        blocksparse_local_blocks, 
-        blocksparse_vert_stride, 
-        blocksparse_block_size, 
-        blocksparse_head_sliding_step
-    )
-    print("Paged attention kernel executed successfully!")
-    print("Output shape:", out.shape)
-    print("Output sum:", out.sum().item())
-except Exception as e:
-    print("Error occurred while running paged attention kernel:", str(e))
+    def verify_cache_and_reshape(self, key: torch.Tensor, value: torch.Tensor, slot_mapping: torch.Tensor):
+        print("slot_mapping:", slot_mapping)
+        for b in range(self.batch_size):
+            for h in range(self.num_heads):
+                for i in range(self.seq_len):
+                    slot = slot_mapping[b * self.seq_len + i].item()
+                    block_idx = slot // self.block_size
+                    block_offset = slot % self.block_size
+
+                    # Verify key
+                    cached_key = self.key_cache[block_idx, h, :, block_offset, :].reshape(self.head_size)
+                    original_key = key[b, i, h]
+                    self.assertTrue(torch.allclose(cached_key, original_key, atol=1e-3), 
+                                    f"Mismatch in key at batch {b}, head {h}, seq {i}")
+
+                    # Verify value
+                    cached_value = self.value_cache[block_idx, h, :, block_offset]
+                    original_value = value[b, i, h]
+                    self.assertTrue(torch.allclose(cached_value, original_value, atol=1e-3), 
+                                    f"Mismatch in value at batch {b}, head {h}, seq {i}")
+
+    def test_paged_attention_correctness(self):
+        # Generate random keys and values
+        key, value = self.generate_random_kv()
+
+        # Cache and reshape keys and values
+        block_table, slot_mapping = self.cache_and_reshape_kv(key, value)
+
+        # Verify that cache_and_reshape worked correctly
+        self.verify_cache_and_reshape(key, value, slot_mapping)
+        print("verify_cache_and_reshape passed...")
+
+
+        # Generate query
+        query = torch.randn(
+            self.batch_size, 1, self.num_heads, self.head_size, 
+            dtype=torch.float16, device=self.device
+        )
+
+        # Compute vanilla attention
+        scale = 1.0 / (self.head_size ** 0.5)
+        key_for_vanilla = key.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_size]
+        value_for_vanilla = value.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_size]
+        query_for_vanilla = query.transpose(1, 2)  # [batch_size, num_heads, 1, head_size]
+        
+        attn_weights = torch.matmul(query_for_vanilla, key_for_vanilla.transpose(-1, -2)) * scale
+        attn_probs = torch.softmax(attn_weights, dim=-1)
+        vanilla_output = torch.matmul(attn_probs, value_for_vanilla)
+
+        print("vanilla output:", vanilla_output)
+        # Compute paged attention
+        seq_lens = torch.full((self.batch_size,), self.seq_len, dtype=torch.int32, device=self.device)
+        paged_output = torch.empty_like(vanilla_output)
+        
+        paged_attention_v1(
+            paged_output,
+            query.reshape(-1, self.num_heads, self.head_size),
+            self.key_cache,
+            self.value_cache,
+            self.num_heads,
+            scale,
+            torch.tensor(block_table, dtype=torch.int32, device=self.device),
+            seq_lens,
+            self.block_size,
+            self.seq_len,
+            None,  # alibi_slopes
+            "auto",
+            1.0,  # kv_scale
+            0,  # tp_rank
+            0,  # blocksparse_local_blocks
+            1,  # blocksparse_vert_stride
+            1,  # blocksparse_block_size
+            0,  # blocksparse_head_sliding_step
+        )
+
+        print("paged_output:", paged_output)
+
+        # Compare outputs
+        self.assertTrue(torch.allclose(vanilla_output, paged_output, atol=1e-2), 
+                        "Mismatch between vanilla attention and paged attention outputs")
+
+if __name__ == "__main__":
+    unittest.main()

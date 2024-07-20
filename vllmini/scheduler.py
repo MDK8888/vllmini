@@ -26,9 +26,9 @@ class Scheduler:
         num_layers = len(self.model.transformer.h)
         
         # Allocate blocks and perform initial prefill
-        seq_id, allocated, slot_mappings, paged_attention_block_table = self.block_manager.allocate_for_prefill(seq_id, num_layers, seq_len)
+        seq_id, _, slot_mappings, paged_attention_block_table = self.block_manager.allocate_for_prefill(seq_id, num_layers, seq_len)
         
-        key_cache, value_cache = self.block_manager.get_kv_cache(seq_id)
+        key_cache, value_cache = self.block_manager.kv_cache.key_cache, self.block_manager.kv_cache.value_cache
         
         logits, _ = self.model(
             input_ids=input_ids,
@@ -71,7 +71,7 @@ class Scheduler:
                 position_ids = torch.tensor([[self.sequence_lengths[seq_id]]], device=input_ids.device)
                 
                 paged_attention_block_table, new_slot_mappings = self.block_manager.decode_step(seq_id, 1)
-                key_cache, value_cache = self.block_manager.get_kv_cache(seq_id)
+                key_cache, value_cache = self.block_manager.kv_cache.key_cache, self.block_manager.kv_cache.value_cache
 
                 logits, _ = self.model(
                     input_ids=input_ids,

@@ -5,6 +5,16 @@ from vllmini.block_manager import BlockManager
 from vllmini.model.gpt2 import GPT2LMHeadModel
 from transformers import GPT2Tokenizer, GPT2Config
 
+def generate_triangular_mask(batch_size, num_heads, seq_len):
+    # Create an upper triangular matrix with -inf, including the diagonal
+    upper_triangular = torch.triu(torch.full((seq_len, seq_len), float('-inf')), diagonal=1)
+    
+    # Expand the upper triangular matrix to match the desired shape
+    mask = upper_triangular.unsqueeze(0).unsqueeze(0)  # shape (1, 1, seq_len, seq_len)
+    mask = mask.expand(batch_size, num_heads, seq_len, seq_len)  # shape (batch_size, num_heads, seq_len, seq_len)
+    mask = mask.to("cuda")
+    return mask
+
 class TestKVCacheAndBlockManager(unittest.TestCase):
     def setUp(self):
         self.num_blocks = 100
@@ -47,11 +57,13 @@ class TestKVCacheAndBlockManager(unittest.TestCase):
         print(f"Initial allocation: {allocated}")
         print(f"Initial paged_attention_block_table: {paged_attention_block_table}")
         
+        attention_mask = generate_triangular_mask(1, 12, seq_len)
+
         # Prefill
         logits, kv_cache = self.model(
             input_ids=input_ids,
-            position_ids=torch.arange(seq_len, device="cuda"),
-            attention_mask=None,
+            position_ids=torch.arange(seq_len, device="cuda").unsqueeze(0),
+            attention_mask=attention_mask,
             use_cache=True,
             key_cache=key_cache,
             value_cache=value_cache,
@@ -62,6 +74,8 @@ class TestKVCacheAndBlockManager(unittest.TestCase):
         generated = input_ids
         key_cache, value_cache = kv_cache[0], kv_cache[1]
         
+        print("logits after prefill:", logits)
+
         print("Prefill completed. Starting decoding phase.")
         
         # Get the first token for decoding phase from the last logits of prefill
@@ -74,7 +88,7 @@ class TestKVCacheAndBlockManager(unittest.TestCase):
 
             logits, kv_cache = self.model(
                 input_ids=next_token,
-                position_ids=torch.tensor([[generated.size(1) - 1]], device="cuda"),
+                position_ids=torch.tensor([generated.size(1) - 1], device="cuda"),
                 attention_mask=None,
                 use_cache=True,
                 is_prefill=False,
@@ -82,20 +96,19 @@ class TestKVCacheAndBlockManager(unittest.TestCase):
                 value_cache=value_cache,
                 slot_mappings=new_slot_mappings,
                 block_tables=paged_attention_block_table,
-                seq_lens=torch.tensor([generated.size(1)], dtype=torch.int32, device="cuda"),
+                seq_lens=torch.tensor([generated.size(1) - 1], dtype=torch.int32, device="cuda"),
                 max_seq_len=self.max_blocks_per_seq
             )
+
+            print(f"logits at step {i}:", logits)
 
             key_cache, value_cache = kv_cache[0], kv_cache[1]
             
             next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
             generated = torch.cat([generated, next_token], dim=1)
-            
-            print(f"Step {i+1}:")
-            print(f"Generated token: {self.tokenizer.decode(next_token.item())}")
-            print(f"logits: {logits}")
-            print("---")
         
+        print("length of generated:", generated.size(1))
+
         generated_text = self.tokenizer.decode(generated[0])
         print(f"Full generated text: {generated_text}")
         

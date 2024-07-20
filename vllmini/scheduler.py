@@ -17,6 +17,7 @@ class Scheduler:
         self.active_sequences: Dict[int, float] = {}  # seq_id: arrival_time
         self.last_logits: Dict[int, torch.Tensor] = {}
         self.sequence_lengths: Dict[int, int] = {}
+        self.sequences: Dict[int, torch.Tensor] = {}
 
     def add_sequence(self, input_ids: torch.Tensor):
         arrival_time = time.time()
@@ -47,7 +48,9 @@ class Scheduler:
         
         self.last_logits[seq_id] = logits[:, -1, :]
         self.sequence_lengths[seq_id] = seq_len
+        self.sequences[seq_id] = input_ids
         print(f"Prefill complete for sequence {seq_id}, length: {seq_len}")
+        return seq_id
 
     def run(self):
         while not self.queue.empty():
@@ -67,12 +70,14 @@ class Scheduler:
                 
                 if self.sequence_lengths[seq_id] >= self.max_length:
                     print(f"Sequence {seq_id} has reached max_length, ending generation")
-                    self.remove_sequence(seq_id)
+                    self.remove_sequence_from_processing(seq_id)
                     continue
 
                 next_token = self.sample_next_token(seq_id)
-                
+                current_sequence = self.sequences[seq_id]
                 input_ids = next_token.unsqueeze(0)
+                self.sequences[seq_id] = torch.cat([current_sequence, next_token.unsqueeze(0)], dim=-1)
+
                 position_ids = torch.tensor([self.sequence_lengths[seq_id]], device=input_ids.device)
                 
                 paged_attention_block_table, new_slot_mappings = self.block_manager.decode_step(seq_id, 1)
@@ -100,7 +105,7 @@ class Scheduler:
                     print(f"Re-queued sequence {seq_id}, current length: {self.sequence_lengths[seq_id]}")
                 else:
                     print(f"Sequence {seq_id} completed or reached max_length, final length: {self.sequence_lengths[seq_id]}")
-                    self.remove_sequence(seq_id)
+                    self.remove_sequence_from_processing(seq_id)
 
             except RuntimeError as e:
                 print(f"Error processing sequence {seq_id}: {str(e)}")
@@ -120,17 +125,21 @@ class Scheduler:
             if seq_to_remove is None:
                 seq_to_remove = max(self.active_sequences, key=self.active_sequences.get)
             print(f"Removing sequence {seq_to_remove} due to memory constraints")
-            self.remove_sequence(seq_to_remove)
+            self.remove_sequence_from_processing(seq_to_remove)
         else:
             print("No active sequences to remove")
 
-    def remove_sequence(self, seq_id: int):
+    def remove_sequence_from_processing(self, seq_id: int):
         self.block_manager.free(seq_id)
         del self.active_sequences[seq_id]
         if seq_id in self.last_logits:
             del self.last_logits[seq_id]
         if seq_id in self.sequence_lengths:
             del self.sequence_lengths[seq_id]
+    
+    def remove_completed_sequence(self, seq_id:int):
+        if seq_id in self.sequences:
+            del self.sequences[seq_id]
 
     def sample_next_token(self, seq_id: int) -> torch.Tensor:
         logits = self.last_logits[seq_id]

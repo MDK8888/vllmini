@@ -5,13 +5,13 @@ from pydantic import BaseModel
 from transformers import GPT2Config, GPT2Tokenizer
 import torch
 
-from .scheduler import Scheduler
-from .paged_attention import PagedAttention
-from .kv_cache import KVCache
+from vllmini.scheduler import Scheduler
+from vllmini.block_manager import BlockManager
+from vllmini.model.gpt2 import GPT2LMHeadModel
 
 class GenerationRequest(BaseModel):
     prompt: str
-    max_length: int = 100
+    max_length: int = 64
 
 class GenerationResponse(BaseModel):
     sequence_id: int
@@ -33,16 +33,21 @@ async def lifespan(app: FastAPI):
     # Initialize components
     config = GPT2Config.from_pretrained("gpt2")
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    num_layers = 12
+    
     num_blocks = 1000
     num_heads = config.num_attention_heads
     head_size = config.hidden_size // num_heads
-    block_size = 128
-    kv_cache = KVCache(num_layers, num_blocks, num_heads, head_size, block_size)
-    paged_attention = PagedAttention("gpt2", kv_cache, device)
+    block_size = 16
+    max_blocks_per_seq = 4
     
-    # Initialize the scheduler with the paged_attention object
-    scheduler = Scheduler(paged_attention, max_length=1024)  # You can adjust max_length as needed
+    block_manager = BlockManager(num_blocks, block_size, num_heads, head_size, max_blocks_per_seq)
+    
+    model = GPT2LMHeadModel(config)
+    model.load_huggingface_weights("gpt2")
+    model = model.to(device).to(torch.float16)
+    
+    # Initialize the scheduler with the model and block_manager
+    scheduler = Scheduler(model, block_manager, max_length=20)  # You can adjust max_length as needed
     
     # Start the scheduler in a background task
     scheduler_task = asyncio.create_task(run_scheduler())
@@ -72,11 +77,10 @@ async def generate(request: GenerationRequest):
 
     tokens = tokenizer.encode(request.prompt)
     input_ids = torch.tensor([tokens], dtype=torch.int64, device=device)
-    position_ids = torch.arange(len(tokens), dtype=torch.int64, device=device).unsqueeze(0)
-    attention_mask = torch.ones((1, len(tokens)), dtype=torch.float32, device=device)
 
-    seq_id = len(scheduler.active_sequences) + 1  # Simple way to generate unique seq_id
-    scheduler.add_sequence(seq_id, input_ids, position_ids, attention_mask)
+    seq_id = scheduler.add_sequence(input_ids)
+
+    # The sequence ID is now generated inside add_sequence
 
     return GenerationResponse(sequence_id=seq_id)
 
@@ -87,20 +91,15 @@ async def get_result(seq_id: int):
     if scheduler is None:
         raise HTTPException(status_code=503, detail="Scheduler not initialized")
 
-    if seq_id not in scheduler.active_sequences and seq_id not in scheduler.block_tables:
-        return ResultResponse(status="not found")
-    
-    if seq_id in scheduler.active_sequences:
-        return ResultResponse(status="in progress")
-    
-    if seq_id in scheduler.block_tables:
-        generated_tokens = []
-        for block in scheduler.block_tables[seq_id]:
-            block_tokens = scheduler.kv_cache.get_block_tokens(block)
-            generated_tokens.extend(block_tokens)
-        
-        generated_text = tokenizer.decode(generated_tokens)
-        return ResultResponse(status="completed", generated=generated_text)
+    if seq_id in scheduler.sequences:
+        generated_ids = scheduler.sequences[seq_id]
+        generated_tokens = tokenizer.decode(generated_ids[0].tolist())
+
+        if seq_id in scheduler.active_sequences:
+            return ResultResponse(status="in progress", generated=generated_tokens)
+
+        scheduler.remove_completed_sequence(seq_id)
+        return ResultResponse(status="completed", generated=generated_tokens)
 
     return ResultResponse(status="error")
 

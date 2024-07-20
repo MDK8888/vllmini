@@ -2,7 +2,6 @@ import os
 from setuptools import setup, find_packages
 import torch.utils.cpp_extension
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-LIBC10_DIR = "/home/kd2374/.local/lib/python3.10/site-packages/torch/lib/libc10.so"
 
 # Get the directory of the current script
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -22,7 +21,7 @@ setup(
                 os.path.join(ROOT_DIR, 'paged_attention_cuda', 'cache_kernels.cu'),  # Add this line
             ],
              include_dirs=torch.utils.cpp_extension.include_paths(),
-             library_dirs=torch.utils.cpp_extension.library_paths() + [LIBC10_DIR],
+             library_dirs=torch.utils.cpp_extension.library_paths(),
             extra_compile_args={
                 'cxx': ['-O3', '-march=native', '-mtune=native'],
                 'nvcc': [

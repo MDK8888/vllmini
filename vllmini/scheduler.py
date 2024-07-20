@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from .block_manager import BlockManager
 from vllmini.model.gpt2 import GPT2LMHeadModel
+from vllmini.model.helpers.generate_triangular_mask import generate_triangular_mask
 
 class Scheduler:
     def __init__(self, model:GPT2LMHeadModel, block_manager:BlockManager, max_length: int):
@@ -17,7 +18,7 @@ class Scheduler:
         self.last_logits: Dict[int, torch.Tensor] = {}
         self.sequence_lengths: Dict[int, int] = {}
 
-    def add_sequence(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+    def add_sequence(self, input_ids: torch.Tensor):
         arrival_time = time.time()
         seq_id = self._generate_seq_id()
         self.queue.put((arrival_time, seq_id))
@@ -31,6 +32,8 @@ class Scheduler:
         
         key_cache, value_cache = self.block_manager.kv_cache.key_cache, self.block_manager.kv_cache.value_cache
         
+        attention_mask = generate_triangular_mask(1, self.block_manager.num_heads, seq_len)
+
         logits, _ = self.model(
             input_ids=input_ids,
             position_ids=torch.arange(seq_len, device=input_ids.device),
@@ -59,6 +62,7 @@ class Scheduler:
                 continue
 
             try:
+                print("current sequence_lengths in run:", self.sequence_lengths)
                 print(f"Processing sequence {seq_id}, current length: {self.sequence_lengths[seq_id]}")
                 
                 if self.sequence_lengths[seq_id] >= self.max_length:
@@ -68,7 +72,7 @@ class Scheduler:
 
                 next_token = self.sample_next_token(seq_id)
                 
-                input_ids = next_token.unsqueeze(0).unsqueeze(0)
+                input_ids = next_token.unsqueeze(0)
                 position_ids = torch.tensor([self.sequence_lengths[seq_id]], device=input_ids.device)
                 
                 paged_attention_block_table, new_slot_mappings = self.block_manager.decode_step(seq_id, 1)
@@ -95,8 +99,8 @@ class Scheduler:
                     self.queue.put((self.active_sequences[seq_id], seq_id))
                     print(f"Re-queued sequence {seq_id}, current length: {self.sequence_lengths[seq_id]}")
                 else:
-                    self.remove_sequence(seq_id)
                     print(f"Sequence {seq_id} completed or reached max_length, final length: {self.sequence_lengths[seq_id]}")
+                    self.remove_sequence(seq_id)
 
             except RuntimeError as e:
                 print(f"Error processing sequence {seq_id}: {str(e)}")

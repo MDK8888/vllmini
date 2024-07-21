@@ -4,9 +4,7 @@ A kernel-up, minimal implementation of vllm.
 ## About this Project
 Since [vllm](https://github.com/vllm-project/vllm) was introduced last year, it has taken the world by storm - it's the best open source AI inference engine out there. With over 20,000 stars, 3,000 forks, and hundreds of contributors, it's many things. Fast. Powerful. Scalable. 
 
-Given that that's the case, then, why build this project? Why build a smaller, less powerful version of a project that people already use in production? The answer to that, my dear reader, lies not in the project as it currently is, but rather in its future. We created vllmini not to be used in production, but as 
-a stepping stone for developers and scientists who are just dipping their toes into the deep ocean of AI infrastructure. The way that we see it, the more 
-people that understand vllm, the more contributions it can receive, and the virtuous cycle of open source development continues! 
+Given that that's the case, then, why build this project? We created vllmini not to be used in production, but as a stepping stone for developers and scientists who are just dipping their toes into the deep ocean of AI infrastructure. The way that we see it, the more people that understand vllm, the more contributions it can receive, and the virtuous cycle of open source development continues! 
 
 With that philosophical explanation out of the way, we can now dive into the technical details. We build vllm from the ground upwards, starting from the same kernels as vllm, then building GPT2 with the kernels integrated, followed by the KVCache manager, the request scheduler, and finally the FastAPI server on top. We will go through each step of this inference stack, diving deep into how each individual part works and how they all fit together. 
 

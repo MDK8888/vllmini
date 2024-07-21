@@ -14,16 +14,24 @@ Are you ready? Let's get started with installation 😎
 
 ## Getting Started
 To get started, you want to make sure that you're on a CUDA-enabled machine. Pop open your linux terminal, and simply run the following in your terminal:
-```./build.sh``` 
+```
+./build.sh
+``` 
 
 Then, to spin up the server, you simply run:
-```python -m vllmini.main```
+```
+python -m vllmini.main
+```
 
 To make requests to the server, just use curl from the terminal:
-```curl -X POST "http://localhost:8000/generate" -H "Content-Type: application/json" -d '{"prompt": "Once upon a time", "max_length": 20}'```
+```
+curl -X POST "http://localhost:8000/generate" -H "Content-Type: application/json" -d '{"prompt": "Once upon a time", "max_length": 20}'
+```
 
 This will return a seq_id to you. Don't lose it, as you will need it to query the result of your prompt:
-```curl "http://localhost:8000/result/{seq_id}"```
+```
+curl "http://localhost:8000/result/{seq_id}"
+```
 
 If everything worked, great! Let's pop open the hood and dive into how vllm really works.
 
@@ -131,11 +139,5 @@ powerful. Essentially, a platform for AI infrastructure for people who don't wan
 
 Anyways, it's almost 11 where I am, so I'm going to head to bed soon. I hope that you had more fun reading this than I had writing it, and you liked my 
 jokes 😂! (All jokes aside, working on this project overall and writing this was very enjoyable for me). Until the next update, so long, and happy building!
-
-
-
-
-
-I 
 
 

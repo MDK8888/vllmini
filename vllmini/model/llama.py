@@ -1,8 +1,9 @@
 import math
 import torch
 from torch import nn
-from transformers import LlamaConfig
-from typing import Optional, Tuple
+from transformers import LlamaConfig         
+from transformers import LlamaForCausalLM as HFLlamaForCausalLM
+from typing import List, Optional, Tuple
 from paged_attention_cuda import paged_attention_v1, cache_ops
 
 class RMSNorm(nn.Module):
@@ -20,17 +21,17 @@ class RMSNorm(nn.Module):
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
+    t = torch.arange(end, device=freqs.device)  # start with CPU, it will be moved to the correct device when needed
+    freqs = torch.outer(t, freqs).float()
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
 def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[:, None, :].expand(xq_.shape[1], -1, -1)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(2)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(2)
+    freqs_cis = freqs_cis[:, None, :].to(xq_.device)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -76,7 +77,7 @@ class LlamaAttention(nn.Module):
         block_table: Optional[torch.Tensor] = None,
         seq_lens: Optional[torch.Tensor] = None,
         max_seq_len: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         batch_size, seq_length, _ = hidden_states.shape
 
         query_states = self.q_proj(hidden_states)
@@ -90,8 +91,15 @@ class LlamaAttention(nn.Module):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb[position_ids[:, -seq_length:]]
-        query_states, key_states = apply_rotary_emb(query_states, key_states, cos, sin)
+        
+        position_ids = position_ids.to(self.rotary_emb.device)
+
+        if position_ids.dim() == 1:
+            freq_cis = self.rotary_emb[position_ids[-seq_length:]]
+        else:
+            freq_cis = self.rotary_emb[position_ids[:, -seq_length:]]
+            
+        query_states, key_states = apply_rotary_emb(query_states, key_states, freq_cis)
 
         if past_key_value is not None:
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
@@ -103,7 +111,7 @@ class LlamaAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        self._cache_kv(key_states, value_states, key_cache, value_cache, slot_mapping)
+        # self._cache_kv(key_states, value_states, key_cache, value_cache, slot_mapping)
 
         if is_prefill:
             attn_output = self._vanilla_attention(query_states, key_states, value_states, attention_mask)
@@ -118,6 +126,29 @@ class LlamaAttention(nn.Module):
 
         return attn_output, attn_weights, past_key_value
 
+    def _cache_kv(self, k: torch.Tensor, v: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor, slot_mapping: torch.Tensor):
+        print("k shape:", k.shape)
+        print("v shape:", v.shape)
+        print("key_cache shape:", key_cache.shape)
+        print("value_cache shape:", value_cache.shape)
+        print("slot_mapping shape:", slot_mapping.shape)
+
+        k = k.view(-1, k.size(-2), k.size(-1))  # [batch_size * seq_len, num_heads, head_dim]
+        v = v.view(-1, v.size(-2), v.size(-1))  # [batch_size * seq_len, num_heads, head_dim]
+
+        print("k shape after reshape:", k.shape)
+        print("v shape after reshape:", v.shape)
+
+        cache_ops.reshape_and_cache(
+            k, 
+            v, 
+            key_cache, 
+            value_cache, 
+            slot_mapping,
+            "auto",  # kv_cache_dtype
+            1.0,  # kv_scale
+        )
+
     def _vanilla_attention(self, q, k, v, attention_mask):
         attn_weights = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
         if attention_mask is not None:
@@ -125,15 +156,8 @@ class LlamaAttention(nn.Module):
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
         return torch.matmul(attn_weights, v)
 
-    def _cache_kv(self, k: torch.Tensor, v: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor, slot_mapping: torch.Tensor):
-        cache_ops.reshape_and_cache(
-            k, v, key_cache, value_cache, slot_mapping,
-            "auto",  # kv_cache_dtype
-            1.0,  # kv_scale
-        )
-
     def _paged_attention(self, q, key_cache, value_cache, block_table, seq_lens, max_seq_len):
-        num_seqs, num_heads, head_dim = q.shape
+        # num_seqs, num_heads, head_dim = q.shape
         out = torch.empty_like(q)
         paged_attention_v1(
             out, q, key_cache, value_cache, self.num_heads,
@@ -144,6 +168,7 @@ class LlamaAttention(nn.Module):
             0, 0, 1, 1, 0,  # Other parameters
         )
         return out
+
 
 class LlamaMLP(nn.Module):
     def __init__(self, config: LlamaConfig):
@@ -278,64 +303,6 @@ class LlamaModel(nn.Module):
 
         return hidden_states, presents
 
-class LlamaModel(nn.Module):
-    def __init__(self, config: LlamaConfig):
-        super().__init__()
-        self.config = config
-        self.vocab_size = config.vocab_size
-        self.hidden_size = config.hidden_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([LlamaBlock(config) for _ in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        self.gradient_checkpointing = False
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rotary_emb = precompute_freqs_cis(self.hidden_size // config.num_attention_heads, self.max_position_embeddings)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        use_cache: bool = True,
-        is_prefill: bool = True,
-        key_cache: Optional[torch.Tensor] = None,
-        value_cache: Optional[torch.Tensor] = None,
-        slot_mappings: Optional[List[torch.Tensor]] = None,
-        block_tables: Optional[List[torch.Tensor]] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        max_seq_len: Optional[int] = None,
-    ):
-        hidden_states = self.embed_tokens(input_ids)
-        presents = () if use_cache else None
-
-        for i, layer in enumerate(self.layers):
-            slot_mapping = slot_mappings[i] if slot_mappings is not None else None
-            block_table = block_tables[i] if block_tables is not None else None
-
-            outputs = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=use_cache,
-                is_prefill=is_prefill,
-                key_cache=key_cache,
-                value_cache=value_cache,
-                slot_mapping=slot_mapping,
-                block_table=block_table,
-                seq_lens=seq_lens,
-                max_seq_len=max_seq_len,
-            )
-
-            hidden_states = outputs[0]
-            if use_cache:
-                presents += (outputs[1],)
-
-        hidden_states = self.norm(hidden_states)
-
-        return hidden_states, presents
-
 class LlamaForCausalLM(nn.Module):
     def __init__(self, config: LlamaConfig):
         super().__init__()
@@ -377,6 +344,9 @@ class LlamaForCausalLM(nn.Module):
         seq_lens: Optional[torch.Tensor] = None,
         max_seq_len: Optional[int] = None,
     ):
+        if position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+        
         outputs = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -431,10 +401,9 @@ class LlamaForCausalLM(nn.Module):
         if self.config.tie_word_embeddings:
             self.get_output_embeddings().weight = self.get_input_embeddings().weight
 
-    def load_huggingface_weights(self, model_name_or_path: str):
-        from transformers import LlamaForCausalLM as HFModel
+    def load_huggingface_weights(self, model_name_or_path: str, cache_dir: Optional[str] = None):
         print(f"Loading weights from {model_name_or_path}")
-        hf_model = HFModel.from_pretrained(model_name_or_path)
+        hf_model = HFLlamaForCausalLM.from_pretrained(model_name_or_path, cache_dir=cache_dir)
         hf_state_dict = hf_model.state_dict()
 
         key_mapping = {

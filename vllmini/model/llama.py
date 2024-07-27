@@ -157,16 +157,37 @@ class LlamaAttention(nn.Module):
         return torch.matmul(attn_weights, v)
 
     def _paged_attention(self, q, key_cache, value_cache, block_table, seq_lens, max_seq_len):
-        # num_seqs, num_heads, head_dim = q.shape
+        print("q shape:", q.shape)
+        print("key_cache shape:", key_cache.shape)
+        print("value_cache shape:", value_cache.shape)
+        print("block_table shape:", block_table.shape)
+        print("seq_lens shape:", seq_lens.shape)
+        print("max_seq_len:", max_seq_len)
+        print("num_heads:", self.num_heads)
+        print("head_dim:", self.head_dim)
+
         out = torch.empty_like(q)
         paged_attention_v1(
-            out, q, key_cache, value_cache, self.num_heads,
-            1.0 / math.sqrt(self.head_dim),  # scale
-            block_table, seq_lens, 16,  # block_size
-            max_seq_len, None,  # alibi_slopes
-            "auto", 1.0,  # kv_scale
-            0, 0, 1, 1, 0,  # Other parameters
+            out,  # [num_seqs, num_heads, head_dim]
+            q,    # [num_seqs, num_heads, head_dim]
+            key_cache,
+            value_cache,
+            self.num_heads,
+            1.0 / math.sqrt(self.head_dim),
+            block_table,
+            seq_lens,
+            16,
+            max_seq_len,
+            None,  # alibi_slopes
+            "auto",
+            1.0,  # kv_scale
+            0,  # tp_rank
+            0,  # blocksparse_local_blocks
+            1,  # blocksparse_vert_stride
+            1,  # blocksparse_block_size
+            0,  # blocksparse_head_sliding_step
         )
+        
         return out
 
 
